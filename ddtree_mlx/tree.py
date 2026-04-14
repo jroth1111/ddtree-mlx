@@ -33,6 +33,7 @@ def build_ddtree_tree_from_topk(
     top_token_ids: np.ndarray,
     top_log_probs: np.ndarray,
     budget: int,
+    depth_penalty: float = 0.0,
 ) -> DDTree:
     """Build a DDTree from precomputed per-position top-k log-probs.
 
@@ -94,7 +95,8 @@ def build_ddtree_tree_from_topk(
         if depth < depth_limit:
             child_ranks = ranks + (0,)
             child_logw = logw + float(top_log_probs[depth, 0])
-            heapq.heappush(heap, (-child_logw, child_ranks, current_index, depth + 1, 0, child_logw))
+            child_priority = child_logw - depth_penalty * (depth + 1)  # penalize deeper nodes
+            heapq.heappush(heap, (-child_priority, child_ranks, current_index, depth + 1, 0, child_logw))
 
     # Build visibility matrix (ancestor-only attention mask)
     current_length = 1 + node_count
@@ -118,6 +120,7 @@ def build_ddtree_tree_from_topk(
 def build_ddtree_tree(
     draft_logits: np.ndarray,
     budget: int,
+    depth_penalty: float = 0.0,
 ) -> DDTree:
     """Build an optimal draft tree from block diffusion per-position logits.
 
@@ -159,6 +162,7 @@ def build_ddtree_tree(
         top_token_ids=top_token_ids,
         top_log_probs=top_log_probs,
         budget=budget,
+        depth_penalty=depth_penalty,
     )
 
 

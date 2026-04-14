@@ -22,6 +22,8 @@ from .cache import fast_path_commit, tree_aware_path_commit
 
 # Default tree budget (configurable via env var or parameter)
 DEFAULT_TREE_BUDGET = int(os.environ.get("DDTREE_BUDGET", "8"))
+# Depth penalty for tree breadth bias (0.0 = no bias, higher = wider/shallower trees)
+DEFAULT_DEPTH_PENALTY = float(os.environ.get("DDTREE_DEPTH_PENALTY", "0.0"))
 
 
 def _tree_token_id(tree: DDTree, root_token: int, tree_index: int) -> int:
@@ -38,6 +40,7 @@ def _build_tree_from_mlx_logits(
     draft_logits: mx.array,
     *,
     budget: int,
+    depth_penalty: float = 0.0,
 ) -> DDTree:
     """Build a DDTree while transferring only top-k draft data to CPU."""
     if budget <= 0 or int(draft_logits.shape[0]) == 0:
@@ -45,6 +48,7 @@ def _build_tree_from_mlx_logits(
             np.empty((0, 0), dtype=np.int64),
             np.empty((0, 0), dtype=np.float32),
             budget,
+            depth_penalty=depth_penalty,
         )
 
     topk = min(int(budget), int(draft_logits.shape[-1]))
@@ -61,6 +65,7 @@ def _build_tree_from_mlx_logits(
         np.array(top_token_ids, copy=False),
         np.array(top_log_probs, copy=False),
         budget=budget,
+        depth_penalty=depth_penalty,
     )
 
 
@@ -199,6 +204,7 @@ def generate_ddtree_once(
         "0",
         "false",
     )
+    depth_penalty = float(os.environ.get("DDTREE_DEPTH_PENALTY", "0.0"))
     tree_aware_commit_count = 0
 
     while len(generated_tokens) < max_new_tokens:
@@ -218,7 +224,8 @@ def generate_ddtree_once(
                 cache=draft_cache,
             )
             draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
-            mx.eval(draft_logits)
+            # Skip mx.eval(draft_logits) — _build_tree_from_mlx_logits evals
+            # only the top-k subset, avoiding full vocab materialization
         else:
             draft_logits = None
         draft_ns += time.perf_counter_ns() - draft_start
@@ -253,7 +260,7 @@ def generate_ddtree_once(
         if suppress_mask is not None:
             floor = mx.array(-1e9, dtype=draft_logits_2d.dtype)
             draft_logits_2d = mx.where(suppress_mask, floor, draft_logits_2d)
-        tree = _build_tree_from_mlx_logits(draft_logits_2d, budget=tree_budget)
+        tree = _build_tree_from_mlx_logits(draft_logits_2d, budget=tree_budget, depth_penalty=depth_penalty)
         root_token = int(staged_first.item())
         compiled = compile_tree(tree, root_token, prefix_len=start)
         dfs_order_list = compiled.dfs_order.tolist()
@@ -393,7 +400,8 @@ def generate_ddtree_once(
                 else hidden_chunks[0]
             )
 
-        mx.eval(committed_hidden)
+        # Defer mx.eval(committed_hidden) — next cycle's draft forward
+        # will implicitly eval it, allowing overlap with Python bookkeeping
         commit_ns += time.perf_counter_ns() - commit_start
 
         # --- UPDATE ---
