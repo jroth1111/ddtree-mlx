@@ -2,7 +2,7 @@
 Benchmark DDTree-MLX vs DFlash baseline.
 
 Usage:
-    python3.12 benchmark.py [--max-tokens 4096] [--budgets 8,16,24]
+    python3.12 benchmark.py [--max-tokens 4096] [--budgets 4,8,16]
 """
 
 import argparse
@@ -63,7 +63,7 @@ def main():
     parser.add_argument("--model", default="mlx-community/Qwen3.5-27B-4bit")
     parser.add_argument("--draft", default=None)
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--budgets", default="8,16,24")
+    parser.add_argument("--budgets", default="4,8,16")
     parser.add_argument("--prompts", type=int, default=3, help="Number of prompts to test")
     parser.add_argument("--output", default=None, help="JSON output file")
     args = parser.parse_args()
@@ -149,6 +149,18 @@ def main():
                     "tree_aware_linear": ddtree_result.get("tree_aware_linear", False),
                     "tree_aware_commit_count": ddtree_result.get(
                         "tree_aware_commit_count", 0
+                    ),
+                    "tree_shape": ddtree_result.get("tree_shape", "heap"),
+                    "adaptive_budget": ddtree_result.get("adaptive_budget", False),
+                    "budget_stats": ddtree_result.get("budget_stats", {}),
+                    "draft_rank_histogram": ddtree_result.get(
+                        "draft_rank_histogram", {}
+                    ),
+                    "dflash_fallback_used": ddtree_result.get(
+                        "dflash_fallback_used", False
+                    ),
+                    "dflash_fallback_tokens": ddtree_result.get(
+                        "dflash_fallback_tokens", 0
                     ),
                     "phase_timings_us": ddtree_result.get("phase_timings_us", {}),
                 })

@@ -14,7 +14,14 @@ from ddtree_mlx.verify import (
     _tree_depth_groups,
     tree_verify_forward,
 )
-from ddtree_mlx.tree import build_ddtree_tree, follow_verified_tree, compute_dfs_order
+from ddtree_mlx.tree import (
+    build_chain_tree_from_topk,
+    build_ddtree_tree,
+    build_hybrid_tree_from_topk,
+    build_root_wide_tree_from_topk,
+    follow_verified_tree,
+    compute_dfs_order,
+)
 
 
 def test_empty_budget():
@@ -40,6 +47,7 @@ def test_basic_tree_structure():
     assert tree.node_count == 4
     assert len(tree.node_token_ids) == 4
     assert len(tree.node_depths) == 4
+    assert len(tree.node_ranks) == 4
     assert len(tree.parents) == 5  # root + 4 nodes
     assert len(tree.child_maps) == 5
     assert tree.visibility.shape == (5, 5)
@@ -183,7 +191,34 @@ def test_mlx_tree_build_matches_numpy_tree_build():
     mlx_tree = _build_tree_from_mlx_logits(mx.array(logits), budget=8)
     assert mlx_tree.node_token_ids.tolist() == numpy_tree.node_token_ids.tolist()
     assert mlx_tree.node_depths.tolist() == numpy_tree.node_depths.tolist()
+    assert mlx_tree.node_ranks.tolist() == numpy_tree.node_ranks.tolist()
     assert mlx_tree.parents == numpy_tree.parents
+
+
+def test_alternate_tree_shapes_are_valid():
+    token_ids = np.array(
+        [
+            [10, 11, 12, 13],
+            [20, 21, 22, 23],
+            [30, 31, 32, 33],
+        ],
+        dtype=np.int64,
+    )
+    log_probs = np.zeros_like(token_ids, dtype=np.float32)
+
+    chain = build_chain_tree_from_topk(token_ids, log_probs, budget=4)
+    assert chain.node_token_ids.tolist() == [10, 20, 30]
+    assert chain.node_ranks.tolist() == [0, 0, 0]
+
+    root_wide = build_root_wide_tree_from_topk(token_ids, log_probs, budget=3)
+    assert root_wide.node_token_ids.tolist() == [10, 11, 12]
+    assert root_wide.node_ranks.tolist() == [0, 1, 2]
+    assert root_wide.parents == [-1, 0, 0, 0]
+
+    hybrid = build_hybrid_tree_from_topk(token_ids, log_probs, budget=4)
+    assert hybrid.node_count == 4
+    assert hybrid.node_ranks[0] == 0
+    assert hybrid.node_ranks[-1] > 0
 
 
 def test_walk_dfs_exact_prefix_fast_path():
@@ -448,6 +483,77 @@ def test_tree_aware_verify_matches_sequential_path_logits():
     assert np.max(np.abs(np.array(tree_path_logits - sequential_logits))) < 1e-3
 
 
+def test_split_tree_attention_matches_masked_attention():
+    args = TextModelArgs(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+        linear_num_value_heads=2,
+        linear_num_key_heads=1,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=2,
+        full_attention_interval=2,
+    )
+    model = TextModel(args)
+    prefix = mx.array([[7]], dtype=mx.uint32)
+    root_token = 1
+    draft_logits = np.full((2, args.vocab_size), -10.0, dtype=np.float32)
+    draft_logits[0, 2] = 10.0
+    draft_logits[0, 3] = 9.0
+    draft_logits[1, 4] = 10.0
+    draft_logits[1, 5] = 9.0
+    tree = build_ddtree_tree(draft_logits, budget=3)
+    compiled = compile_tree(tree, root_token_id=root_token, prefix_len=1)
+
+    masked_cache = make_target_cache(model, enable_speculative_linear_cache=False)
+    split_cache = make_target_cache(model, enable_speculative_linear_cache=False)
+    target_forward_with_hidden_states(
+        model,
+        input_ids=prefix,
+        cache=masked_cache,
+        capture_layer_ids=set(),
+    )
+    target_forward_with_hidden_states(
+        model,
+        input_ids=prefix,
+        cache=split_cache,
+        capture_layer_ids=set(),
+    )
+
+    old_split = verify_module._SPLIT_TREE_ATTENTION
+    old_min_prefix = verify_module._SPLIT_TREE_ATTENTION_MIN_PREFIX
+    try:
+        verify_module._SPLIT_TREE_ATTENTION = False
+        masked_logits, _ = tree_verify_forward(
+            model,
+            compiled_tree=compiled,
+            cache=masked_cache,
+            capture_layer_ids=set(),
+            tree_aware_linear=True,
+            tree_cache_state={},
+        )
+        verify_module._SPLIT_TREE_ATTENTION = True
+        verify_module._SPLIT_TREE_ATTENTION_MIN_PREFIX = 1
+        split_logits, _ = tree_verify_forward(
+            model,
+            compiled_tree=compiled,
+            cache=split_cache,
+            capture_layer_ids=set(),
+            tree_aware_linear=True,
+            tree_cache_state={},
+        )
+    finally:
+        verify_module._SPLIT_TREE_ATTENTION = old_split
+        verify_module._SPLIT_TREE_ATTENTION_MIN_PREFIX = old_min_prefix
+
+    mx.eval(masked_logits, split_logits)
+    assert np.max(np.abs(np.array(masked_logits - split_logits))) < 1e-3
+
+
 if __name__ == "__main__":
     test_empty_budget()
     test_empty_logits()
@@ -460,6 +566,7 @@ if __name__ == "__main__":
     test_budget_equal_vocab()
     test_compile_tree_mask_is_tree_only()
     test_mlx_tree_build_matches_numpy_tree_build()
+    test_alternate_tree_shapes_are_valid()
     test_walk_dfs_exact_prefix_fast_path()
     test_walk_dfs_exact_prefix_divergence()
     test_tree_aware_gated_delta_matches_chain_forward()
@@ -467,4 +574,5 @@ if __name__ == "__main__":
     test_tree_aware_gated_delta_kernel_matches_fallback()
     test_tree_aware_path_commit_packs_arbitrary_path()
     test_tree_aware_verify_matches_sequential_path_logits()
+    test_split_tree_attention_matches_masked_attention()
     print("All tree tests passed!")

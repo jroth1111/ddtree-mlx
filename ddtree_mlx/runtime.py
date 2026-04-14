@@ -9,19 +9,87 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import mlx.core as mx
 import numpy as np
 
-from .tree import DDTree, build_ddtree_tree_from_topk, follow_verified_tree
+from .tree import (
+    DDTree,
+    build_chain_tree_from_topk,
+    build_ddtree_tree_from_topk,
+    build_hybrid_tree_from_topk,
+    build_root_wide_tree_from_topk,
+    follow_verified_tree,
+)
 from .compile import compile_tree
 from .verify import tree_verify_forward
 from .cache import fast_path_commit, tree_aware_path_commit
 
 
 # Default tree budget (configurable via env var or parameter)
-DEFAULT_TREE_BUDGET = int(os.environ.get("DDTREE_BUDGET", "8"))
+DEFAULT_TREE_BUDGET = int(os.environ.get("DDTREE_BUDGET", "4"))
+
+
+@dataclass
+class _BudgetStats:
+    cycles: int = 0
+    accepted: int = 0
+    elapsed_ns: int = 0
+
+    def score(self) -> float:
+        if self.cycles == 0 or self.elapsed_ns <= 0:
+            return 0.0
+        return self.accepted / (self.elapsed_ns / 1e9)
+
+
+@dataclass
+class _BudgetController:
+    budgets: list[int]
+    warmup_cycles: int
+    min_cycles: int
+    stats: dict[int, _BudgetStats] = field(default_factory=dict)
+    cycle: int = 0
+
+    def __post_init__(self) -> None:
+        self.budgets = sorted(set(int(b) for b in self.budgets if int(b) > 0))
+        self.stats = {budget: _BudgetStats() for budget in self.budgets}
+
+    def choose(self, prefix_len: int) -> int:
+        del prefix_len
+        if not self.budgets:
+            return 0
+        for budget in self.budgets:
+            if self.stats[budget].cycles < self.warmup_cycles:
+                return budget
+        eligible = [
+            (stats.score(), -budget, budget)
+            for budget, stats in self.stats.items()
+            if stats.cycles >= self.min_cycles
+        ]
+        if not eligible:
+            return self.budgets[self.cycle % len(self.budgets)]
+        return max(eligible)[2]
+
+    def record(self, budget: int, accepted: int, elapsed_ns: int) -> None:
+        if budget not in self.stats:
+            return
+        stats = self.stats[budget]
+        stats.cycles += 1
+        stats.accepted += int(accepted)
+        stats.elapsed_ns += int(elapsed_ns)
+        self.cycle += 1
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            str(budget): {
+                "cycles": stats.cycles,
+                "accepted": stats.accepted,
+                "tokens_per_second": stats.score(),
+            }
+            for budget, stats in self.stats.items()
+        }
 
 
 def _tree_token_id(tree: DDTree, root_token: int, tree_index: int) -> int:
@@ -34,10 +102,23 @@ def _tree_token_ids(tree: DDTree, root_token: int, indices: list[int]) -> list[i
     return [_tree_token_id(tree, root_token, idx) for idx in indices]
 
 
+def _parse_budget_candidates(max_budget: int) -> list[int]:
+    raw = os.environ.get("DDTREE_ADAPTIVE_BUDGETS")
+    if raw:
+        values = [int(part) for part in raw.split(",") if part.strip()]
+    else:
+        values = [4, 8, 16, 24]
+    candidates = sorted({value for value in values if 0 < value <= max_budget})
+    if max_budget > 0 and max_budget not in candidates:
+        candidates.append(max_budget)
+    return sorted(candidates)
+
+
 def _build_tree_from_mlx_logits(
     draft_logits: mx.array,
     *,
     budget: int,
+    shape: str = "heap",
 ) -> DDTree:
     """Build a DDTree while transferring only top-k draft data to CPU."""
     if budget <= 0 or int(draft_logits.shape[0]) == 0:
@@ -57,10 +138,21 @@ def _build_tree_from_mlx_logits(
     top_log_probs = top_logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     mx.eval(top_token_ids, top_log_probs)
 
+    top_token_ids_np = np.array(top_token_ids, copy=False)
+    top_log_probs_np = np.array(top_log_probs, copy=False)
+    if shape == "chain":
+        return build_chain_tree_from_topk(top_token_ids_np, top_log_probs_np, budget)
+    if shape in ("root", "root_wide", "root-wide"):
+        return build_root_wide_tree_from_topk(
+            top_token_ids_np, top_log_probs_np, budget
+        )
+    if shape == "hybrid":
+        return build_hybrid_tree_from_topk(top_token_ids_np, top_log_probs_np, budget)
     return build_ddtree_tree_from_topk(
-        np.array(top_token_ids, copy=False),
-        np.array(top_log_probs, copy=False),
+        top_token_ids_np,
+        top_log_probs_np,
         budget=budget,
+        depth_penalty=float(os.environ.get("DDTREE_DEPTH_PENALTY", "0")),
     )
 
 
@@ -130,6 +222,7 @@ def generate_ddtree_once(
         build_suppress_token_mask,
         _eval_logits_and_captured,
         _arm_target_rollback_with_prefix,
+        generate_dflash_once,
     )
     from dflash_mlx.model import ContextOnlyDraftKVCache
 
@@ -200,10 +293,60 @@ def generate_ddtree_once(
         "false",
     )
     tree_aware_commit_count = 0
+    tree_shape = os.environ.get("DDTREE_TREE_SHAPE", "heap").lower()
+    adaptive_budget = os.environ.get("DDTREE_ADAPTIVE_BUDGET", "0").lower() not in (
+        "",
+        "0",
+        "false",
+    )
+    budget_controller = (
+        _BudgetController(
+            budgets=_parse_budget_candidates(int(tree_budget)),
+            warmup_cycles=int(os.environ.get("DDTREE_ADAPTIVE_WARMUP", "2")),
+            min_cycles=int(os.environ.get("DDTREE_ADAPTIVE_MIN_CYCLES", "2")),
+        )
+        if adaptive_budget
+        else None
+    )
+    budget_history: list[int] = []
+    draft_rank_histogram: dict[int, int] = {}
+    dflash_fallback_prefix = int(os.environ.get("DDTREE_DFLASH_FALLBACK_PREFIX", "0"))
+    dflash_fallback_used = False
+    dflash_fallback_tokens = 0
+    dflash_fallback_ns = 0
 
     while len(generated_tokens) < max_new_tokens:
         remaining = max_new_tokens - len(generated_tokens)
         block_len = max(1, min(block_size, remaining))
+        if (
+            dflash_fallback_prefix > 0
+            and len(generated_tokens) >= dflash_fallback_prefix
+        ):
+            fallback_start = time.perf_counter_ns()
+            fallback_prompt = list(prompt_tokens) + generated_tokens
+            fallback_result = generate_dflash_once(
+                target_model=target_model,
+                tokenizer=tokenizer,
+                draft_model=draft_model,
+                prompt="",
+                max_new_tokens=remaining,
+                use_chat_template=False,
+                stop_token_ids=stop_token_ids,
+                suppress_token_ids=suppress_token_ids,
+                prompt_tokens_override=fallback_prompt,
+            )
+            dflash_fallback_ns += time.perf_counter_ns() - fallback_start
+            fallback_tokens = list(fallback_result.get("generated_token_ids", []))
+            generated_tokens.extend(fallback_tokens)
+            dflash_fallback_tokens += len(fallback_tokens)
+            dflash_fallback_used = True
+            break
+
+        cycle_start_ns = time.perf_counter_ns()
+        current_budget = (
+            budget_controller.choose(start) if budget_controller is not None else tree_budget
+        )
+        budget_history.append(int(current_budget))
 
         # --- DRAFT ---
         draft_start = time.perf_counter_ns()
@@ -253,7 +396,11 @@ def generate_ddtree_once(
         if suppress_mask is not None:
             floor = mx.array(-1e9, dtype=draft_logits_2d.dtype)
             draft_logits_2d = mx.where(suppress_mask, floor, draft_logits_2d)
-        tree = _build_tree_from_mlx_logits(draft_logits_2d, budget=tree_budget)
+        tree = _build_tree_from_mlx_logits(
+            draft_logits_2d,
+            budget=current_budget,
+            shape=tree_shape,
+        )
         root_token = int(staged_first.item())
         compiled = compile_tree(tree, root_token, prefix_len=start)
         dfs_order_list = compiled.dfs_order.tolist()
@@ -402,6 +549,9 @@ def generate_ddtree_once(
         accepted_token_ids_list = _tree_token_ids(tree, root_token, accepted_indices)
         n_accepted = len(accepted_indices)  # includes root
         acceptance_history.append(n_accepted)
+        for accepted_index in accepted_indices[1:]:
+            rank = int(tree.node_ranks[accepted_index - 1])
+            draft_rank_histogram[rank] = draft_rank_histogram.get(rank, 0) + 1
         emitted_token_ids = accepted_token_ids_list
         stop_hit = False
         if stop_token_array is not None:
@@ -415,6 +565,12 @@ def generate_ddtree_once(
         target_hidden = committed_hidden
         staged_first = mx.array([bonus_token], dtype=mx.uint32)
         cycles_completed += 1
+        if budget_controller is not None:
+            budget_controller.record(
+                int(current_budget),
+                n_accepted,
+                time.perf_counter_ns() - cycle_start_ns,
+            )
 
         if stop_hit:
             break
@@ -457,6 +613,16 @@ def generate_ddtree_once(
         "slow_path_count": slow_path_count,
         "tree_aware_commit_count": tree_aware_commit_count,
         "tree_aware_linear": tree_aware_linear,
+        "tree_shape": tree_shape,
+        "adaptive_budget": adaptive_budget,
+        "budget_history": budget_history,
+        "budget_stats": budget_controller.summary() if budget_controller else {},
+        "draft_rank_histogram": {
+            str(rank): count for rank, count in sorted(draft_rank_histogram.items())
+        },
+        "dflash_fallback_used": dflash_fallback_used,
+        "dflash_fallback_tokens": dflash_fallback_tokens,
+        "dflash_fallback_us": dflash_fallback_ns / 1_000.0,
         "fast_path_ratio": (
             fast_path_count / (fast_path_count + slow_path_count)
             if (fast_path_count + slow_path_count) > 0

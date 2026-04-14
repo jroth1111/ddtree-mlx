@@ -23,6 +23,7 @@ class DDTree(NamedTuple):
 
     node_token_ids: np.ndarray  # (N,) int64 — token ID for each tree node
     node_depths: np.ndarray     # (N,) int64 — depth of each node (1-based: root's children are depth 1)
+    node_ranks: np.ndarray      # (N,) int64 — draft rank at that depth for each tree node
     parents: list[int]          # (N+1,) — parent index for each node; parents[0] = -1 (root)
     child_maps: list[dict[int, int]]  # (N+1,) — {token_id: child_index} for each node
     visibility: np.ndarray      # (N+1, N+1) bool — ancestor-only attention mask
@@ -33,6 +34,7 @@ def build_ddtree_tree_from_topk(
     top_token_ids: np.ndarray,
     top_log_probs: np.ndarray,
     budget: int,
+    depth_penalty: float = 0.0,
 ) -> DDTree:
     """Build a DDTree from precomputed per-position top-k log-probs.
 
@@ -47,6 +49,7 @@ def build_ddtree_tree_from_topk(
         return DDTree(
             node_token_ids=np.empty(0, dtype=np.int64),
             node_depths=np.empty(0, dtype=np.int64),
+            node_ranks=np.empty(0, dtype=np.int64),
             parents=[-1],
             child_maps=[{}],
             visibility=visibility,
@@ -61,12 +64,16 @@ def build_ddtree_tree_from_topk(
     # Best-first heap search (Algorithm 1)
     # Heap entries: (-logw, ranks_tuple, parent_index, depth, rank, logw)
     first_logw = float(top_log_probs[0, 0])
+    def priority(logw: float, depth: int) -> float:
+        return -(logw - float(depth_penalty) * float(depth))
+
     heap: list[tuple[float, tuple[int, ...], int, int, int, float]] = [
-        (-first_logw, (0,), 0, 1, 0, first_logw)
+        (priority(first_logw, 1), (0,), 0, 1, 0, first_logw)
     ]
 
     node_token_ids = np.empty(budget, dtype=np.int64)
     node_depths = np.empty(budget, dtype=np.int64)
+    node_ranks = np.empty(budget, dtype=np.int64)
     parents = np.empty(budget + 1, dtype=np.int32)
     parents[0] = -1
     child_maps: list[dict[int, int]] = [{}]
@@ -79,6 +86,7 @@ def build_ddtree_tree_from_topk(
         current_index = node_count + 1
         node_token_ids[node_count] = token_id
         node_depths[node_count] = depth
+        node_ranks[node_count] = rank
         parents[current_index] = parent_index
         child_maps.append({})
         child_maps[parent_index][token_id] = current_index
@@ -88,13 +96,13 @@ def build_ddtree_tree_from_topk(
         if rank + 1 < topk:
             sibling_ranks = ranks[:-1] + (rank + 1,)
             sibling_logw = logw - float(top_log_probs[depth - 1, rank]) + float(top_log_probs[depth - 1, rank + 1])
-            heapq.heappush(heap, (-sibling_logw, sibling_ranks, parent_index, depth, rank + 1, sibling_logw))
+            heapq.heappush(heap, (priority(sibling_logw, depth), sibling_ranks, parent_index, depth, rank + 1, sibling_logw))
 
         # Push first child (rank 0 at next depth)
         if depth < depth_limit:
             child_ranks = ranks + (0,)
             child_logw = logw + float(top_log_probs[depth, 0])
-            heapq.heappush(heap, (-child_logw, child_ranks, current_index, depth + 1, 0, child_logw))
+            heapq.heappush(heap, (priority(child_logw, depth + 1), child_ranks, current_index, depth + 1, 0, child_logw))
 
     # Build visibility matrix (ancestor-only attention mask)
     current_length = 1 + node_count
@@ -108,11 +116,128 @@ def build_ddtree_tree_from_topk(
     return DDTree(
         node_token_ids=node_token_ids[:node_count],
         node_depths=node_depths[:node_count],
+        node_ranks=node_ranks[:node_count],
         parents=parents[:current_length].tolist(),
         child_maps=child_maps,
         visibility=visibility,
         node_count=node_count,
     )
+
+
+def _tree_from_node_specs(
+    specs: list[tuple[int, int, int, int]],
+    *,
+    budget: int,
+) -> DDTree:
+    """Build a DDTree from (token_id, depth, parent, rank) node specs."""
+    if budget <= 0 or not specs:
+        visibility = np.zeros((1, 1), dtype=np.bool_)
+        visibility[0, 0] = True
+        return DDTree(
+            node_token_ids=np.empty(0, dtype=np.int64),
+            node_depths=np.empty(0, dtype=np.int64),
+            node_ranks=np.empty(0, dtype=np.int64),
+            parents=[-1],
+            child_maps=[{}],
+            visibility=visibility,
+            node_count=0,
+        )
+
+    specs = specs[:budget]
+    node_count = len(specs)
+    node_token_ids = np.empty(node_count, dtype=np.int64)
+    node_depths = np.empty(node_count, dtype=np.int64)
+    node_ranks = np.empty(node_count, dtype=np.int64)
+    parents = [-1]
+    child_maps: list[dict[int, int]] = [{}]
+
+    for node_pos, (token_id, depth, parent_index, rank) in enumerate(specs):
+        current_index = node_pos + 1
+        if parent_index >= current_index:
+            raise ValueError("tree node parent must be emitted before child")
+        node_token_ids[node_pos] = int(token_id)
+        node_depths[node_pos] = int(depth)
+        node_ranks[node_pos] = int(rank)
+        parents.append(int(parent_index))
+        child_maps.append({})
+        child_maps[parent_index][int(token_id)] = current_index
+
+    visibility = np.zeros((node_count + 1, node_count + 1), dtype=np.bool_)
+    visibility[0, 0] = True
+    for index in range(1, node_count + 1):
+        parent_index = parents[index]
+        visibility[index, :index] = visibility[parent_index, :index]
+        visibility[index, index] = True
+
+    return DDTree(
+        node_token_ids=node_token_ids,
+        node_depths=node_depths,
+        node_ranks=node_ranks,
+        parents=parents,
+        child_maps=child_maps,
+        visibility=visibility,
+        node_count=node_count,
+    )
+
+
+def build_chain_tree_from_topk(
+    top_token_ids: np.ndarray,
+    top_log_probs: np.ndarray,
+    budget: int,
+) -> DDTree:
+    """Build a top-1 chain tree for shape experiments."""
+    del top_log_probs
+    depth_limit = int(top_token_ids.shape[0])
+    specs: list[tuple[int, int, int, int]] = []
+    parent = 0
+    for depth in range(1, min(int(budget), depth_limit) + 1):
+        token_id = int(top_token_ids[depth - 1, 0])
+        specs.append((token_id, depth, parent, 0))
+        parent = len(specs)
+    return _tree_from_node_specs(specs, budget=budget)
+
+
+def build_root_wide_tree_from_topk(
+    top_token_ids: np.ndarray,
+    top_log_probs: np.ndarray,
+    budget: int,
+) -> DDTree:
+    """Build a one-level tree with root siblings only."""
+    del top_log_probs
+    if top_token_ids.shape[0] == 0:
+        return _tree_from_node_specs([], budget=budget)
+    topk = min(int(budget), int(top_token_ids.shape[1]))
+    specs = [
+        (int(top_token_ids[0, rank]), 1, 0, rank)
+        for rank in range(topk)
+    ]
+    return _tree_from_node_specs(specs, budget=budget)
+
+
+def build_hybrid_tree_from_topk(
+    top_token_ids: np.ndarray,
+    top_log_probs: np.ndarray,
+    budget: int,
+) -> DDTree:
+    """Build a top-1 chain with remaining nodes as root alternatives."""
+    del top_log_probs
+    depth_limit = int(top_token_ids.shape[0])
+    if budget <= 0 or depth_limit == 0:
+        return _tree_from_node_specs([], budget=budget)
+
+    chain_len = max(1, min(depth_limit, (int(budget) + 1) // 2))
+    specs: list[tuple[int, int, int, int]] = []
+    parent = 0
+    for depth in range(1, chain_len + 1):
+        specs.append((int(top_token_ids[depth - 1, 0]), depth, parent, 0))
+        parent = len(specs)
+
+    rank = 1
+    while len(specs) < budget and rank < top_token_ids.shape[1]:
+        specs.append((int(top_token_ids[0, rank]), 1, 0, rank))
+        rank += 1
+
+    return _tree_from_node_specs(specs, budget=budget)
 
 
 def build_ddtree_tree(

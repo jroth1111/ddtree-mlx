@@ -38,6 +38,15 @@ _TREE_KERNEL_ENABLED = os.environ.get("DDTREE_TREE_KERNEL", "1").lower() not in 
     "0",
     "false",
 )
+_SPLIT_TREE_ATTENTION = os.environ.get(
+    "DDTREE_SPLIT_TREE_ATTENTION", "0"
+).lower() not in ("", "0", "false")
+_SPLIT_TREE_ATTENTION_MIN_PREFIX = int(
+    os.environ.get(
+        "DDTREE_SPLIT_TREE_ATTENTION_MIN_PREFIX",
+        str(_HYBRID_SDPA_EXACT_KV_THRESHOLD),
+    )
+)
 
 
 def _rope_with_positions(
@@ -62,6 +71,66 @@ def _rope_with_positions(
     x_roped = rope_fn(x_reshaped, offset=position_ids)
     # [T, H, 1, D] → [1, H, T, D]
     return x_roped.reshape(1, T, H, D).transpose(0, 2, 1, 3)
+
+
+def _repeat_kv_heads(x: mx.array, query_heads: int) -> mx.array:
+    kv_heads = int(x.shape[1])
+    if kv_heads == query_heads:
+        return x
+    if query_heads % kv_heads != 0:
+        raise ValueError(f"query heads {query_heads} not divisible by KV heads {kv_heads}")
+    return mx.repeat(x, query_heads // kv_heads, axis=1)
+
+
+def _split_prefix_tree_attention_exact(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    *,
+    scale: float,
+    mask: mx.array,
+    cached_prefix_len: int,
+) -> mx.array:
+    """Exact attention by separately scoring prefix and tree-local tokens.
+
+    Prefix attention has no tree mask; tree-local attention uses the small
+    ancestor mask. The two numerators/denominators are recombined exactly via
+    log-sum-exp scaling.
+    """
+    query_heads = int(queries.shape[1])
+    keys = _repeat_kv_heads(keys, query_heads)
+    values = _repeat_kv_heads(values, query_heads)
+
+    queries_f = queries.astype(mx.float32)
+    keys_f = keys.astype(mx.float32)
+    values_f = values.astype(mx.float32)
+
+    prefix_keys = keys_f[:, :, :cached_prefix_len, :]
+    prefix_values = values_f[:, :, :cached_prefix_len, :]
+    tree_keys = keys_f[:, :, cached_prefix_len:, :]
+    tree_values = values_f[:, :, cached_prefix_len:, :]
+
+    prefix_scores = (
+        mx.matmul(queries_f, prefix_keys.transpose(0, 1, 3, 2)) * scale
+    )
+    prefix_max = mx.max(prefix_scores, axis=-1, keepdims=True)
+    prefix_weights = mx.exp(prefix_scores - prefix_max)
+    prefix_den = mx.sum(prefix_weights, axis=-1, keepdims=True)
+    prefix_num = mx.matmul(prefix_weights, prefix_values)
+
+    tree_scores = mx.matmul(queries_f, tree_keys.transpose(0, 1, 3, 2)) * scale
+    tree_scores = tree_scores + mask[..., cached_prefix_len:].astype(mx.float32)
+    tree_max = mx.max(tree_scores, axis=-1, keepdims=True)
+    tree_weights = mx.exp(tree_scores - tree_max)
+    tree_den = mx.sum(tree_weights, axis=-1, keepdims=True)
+    tree_num = mx.matmul(tree_weights, tree_values)
+
+    combined_max = mx.maximum(prefix_max, tree_max)
+    prefix_scale = mx.exp(prefix_max - combined_max)
+    tree_scale = mx.exp(tree_max - combined_max)
+    numerator = prefix_num * prefix_scale + tree_num * tree_scale
+    denominator = prefix_den * prefix_scale + tree_den * tree_scale
+    return (numerator / denominator).astype(queries.dtype)
 
 
 def _attention_forward_with_tree(
@@ -116,7 +185,21 @@ def _attention_forward_with_tree(
         and cached_prefix_len >= _HYBRID_SDPA_EXACT_KV_THRESHOLD
         and isinstance(mask, mx.array)
     )
-    if should_split:
+    if (
+        _SPLIT_TREE_ATTENTION
+        and cached_prefix_len >= _SPLIT_TREE_ATTENTION_MIN_PREFIX
+        and isinstance(mask, mx.array)
+        and not isinstance(keys, tuple)
+    ):
+        output = _split_prefix_tree_attention_exact(
+            queries,
+            keys,
+            values,
+            scale=attn.scale,
+            mask=mask,
+            cached_prefix_len=cached_prefix_len,
+        )
+    elif should_split:
         output = _split_sdpa_output(
             queries=queries,
             keys=keys,
