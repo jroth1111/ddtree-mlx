@@ -6,11 +6,14 @@ Processes all tree nodes in DFS order through the model:
 - Linear layers: sequential processing in DFS order (recurrent)
 
 The DFS ordering ensures the most-probable path is processed first,
-maximizing fast-path commit opportunities (tape rollback).
+maximizing fast-path commit opportunities (tape rollback). For recurrent
+linear layers, only the DFS prefix is exact; runtime re-forwards divergent
+suffixes before committing them.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -22,6 +25,8 @@ from .compile import CompiledTree
 from dflash_mlx.runtime import (
     _target_text_model,
     _lm_head_logits,
+    _split_sdpa_output,
+    _HYBRID_SDPA_EXACT_KV_THRESHOLD,
 )
 
 
@@ -61,6 +66,7 @@ def _attention_forward_with_tree(
     Based on mlx_lm/models/qwen3_next.py:120-158.
     """
     B, L, D = x.shape
+    cached_prefix_len = int(getattr(cache, "offset", 0) or 0) if cache is not None else 0
 
     # Q projection + split into queries and gate
     q_proj_output = attn.q_proj(x)
@@ -91,18 +97,30 @@ def _attention_forward_with_tree(
     kv_len = keys.shape[2]
     mask_kv_len = mask.shape[-1]
     if mask_kv_len != kv_len:
-        # Pad or trim mask to match actual KV cache length
-        if mask_kv_len < kv_len:
-            # KV cache has more entries than expected — extend mask with zeros (attend)
-            pad = mx.zeros((mask.shape[0], mask.shape[1], mask.shape[2], kv_len - mask_kv_len), dtype=mask.dtype)
-            mask = mx.concatenate([pad, mask], axis=-1)
-        else:
-            # Mask is too wide — trim from the left (prefix side)
-            mask = mask[:, :, :, mask_kv_len - kv_len:]
+        raise ValueError(
+            f"tree attention mask width {mask_kv_len} does not match KV length {kv_len}"
+        )
 
-    output = mx.fast.scaled_dot_product_attention(
-        queries, keys, values, scale=attn.scale, mask=mask
+    should_split = (
+        cache is not None
+        and cached_prefix_len >= _HYBRID_SDPA_EXACT_KV_THRESHOLD
+        and isinstance(mask, mx.array)
     )
+    if should_split:
+        output = _split_sdpa_output(
+            queries=queries,
+            keys=keys,
+            values=values,
+            scale=attn.scale,
+            mask=mask,
+            cache=cache,
+            chunk_size=1,
+            cached_prefix_len=cached_prefix_len,
+        )
+    else:
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=attn.scale, mask=mask
+        )
     output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
     # Gate and output projection
@@ -115,6 +133,7 @@ def tree_verify_forward(
     compiled_tree: CompiledTree,
     cache: list[Any],
     capture_layer_ids: Optional[set[int]] = None,
+    profile_timings: Optional[dict[str, int]] = None,
 ) -> tuple[mx.array, dict[int, mx.array]]:
     """Run the target model on all tree nodes with tree attention.
 
@@ -126,6 +145,7 @@ def tree_verify_forward(
         compiled_tree: CompiledTree from compile_tree().
         cache: List of per-layer caches (KVCache for attention, ArraysCache for linear).
         capture_layer_ids: Set of layer indices to capture hidden states (for draft conditioning).
+        profile_timings: Optional dict updated with synchronized layer timings.
 
     Returns:
         (logits, captured_hidden_states):
@@ -161,8 +181,8 @@ def tree_verify_forward(
     position_ids_dfs = ct.position_ids[dfs]
 
     # Build attention mask from tree visibility, using actual cache prefix length
-    # Tree visibility (tree-index order): (N+1, N+1) bool
-    tree_vis = ct.attention_mask[:, :, :, -ct.tree_size:]  # extract tree-to-tree part
+    # Tree visibility additive mask (tree-index order): (N+1, N+1)
+    tree_vis = ct.attention_mask
 
     # Reorder to DFS order
     tree_vis_dfs = tree_vis[:, :, dfs, :][:, :, :, dfs]
@@ -186,6 +206,7 @@ def tree_verify_forward(
 
     # Process through each layer
     for layer_idx, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
+        layer_start_ns = time.perf_counter_ns() if profile_timings is not None else 0
         if layer.is_linear:
             # Linear layer: process in DFS order (sequential recurrent)
             r = layer.linear_attn(layer.input_layernorm(h), ssm_mask, layer_cache)
@@ -202,6 +223,13 @@ def tree_verify_forward(
             )
             h = h + r
             h = h + layer.mlp(layer.post_attention_layernorm(h))
+
+        if profile_timings is not None:
+            mx.eval(h)
+            key = "linear_ns" if layer.is_linear else "attention_ns"
+            profile_timings[key] = profile_timings.get(key, 0) + (
+                time.perf_counter_ns() - layer_start_ns
+            )
 
         if capture_layer_ids and (layer_idx + 1) in capture_layer_ids:
             captured[layer_idx + 1] = h[:, inv_dfs, :]  # tree-index order

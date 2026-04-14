@@ -29,24 +29,19 @@ class DDTree(NamedTuple):
     node_count: int             # number of tree nodes (excluding root)
 
 
-def build_ddtree_tree(
-    draft_logits: np.ndarray,
+def build_ddtree_tree_from_topk(
+    top_token_ids: np.ndarray,
+    top_log_probs: np.ndarray,
     budget: int,
 ) -> DDTree:
-    """Build an optimal draft tree from block diffusion per-position logits.
-
-    Implements Algorithm 1 from the DDTree paper. Uses a max-heap keyed by
-    log-probability to greedily select the B highest-probability prefixes.
+    """Build a DDTree from precomputed per-position top-k log-probs.
 
     Args:
-        draft_logits: (L, vocab_size) float32 — per-position logits from
-            the DFlash draft model for positions 1..L after the bonus token.
+        top_token_ids: (L, K) int array sorted by descending log-probability.
+        top_log_probs: (L, K) float array aligned with top_token_ids.
         budget: Maximum number of tree nodes (excluding root).
-
-    Returns:
-        DDTree namedtuple with tree structure and visibility matrix.
     """
-    if budget <= 0 or draft_logits.shape[0] == 0:
+    if budget <= 0 or top_token_ids.shape[0] == 0 or top_token_ids.shape[1] == 0:
         visibility = np.zeros((1, 1), dtype=np.bool_)
         visibility[0, 0] = True
         return DDTree(
@@ -58,22 +53,10 @@ def build_ddtree_tree(
             node_count=0,
         )
 
-    topk = min(budget, draft_logits.shape[-1])
-    depth_limit = int(draft_logits.shape[0])
-
-    # Compute top-K log-probabilities per position
-    logits = draft_logits.astype(np.float32)
-    # Partial sort for top-K indices
-    top_indices = np.argpartition(-logits, topk, axis=-1)[:, :topk]
-    top_logits = np.take_along_axis(logits, top_indices, axis=-1)
-    # Sort within top-K for descending order
-    sort_order = np.argsort(-top_logits, axis=-1)
-    top_token_ids = np.take_along_axis(top_indices, sort_order, axis=-1)
-    top_logits = np.take_along_axis(top_logits, sort_order, axis=-1)
-
-    # Log-softmax for log-probabilities
-    log_z = np.log(np.sum(np.exp(logits - logits.max(axis=-1, keepdims=True)), axis=-1, keepdims=True)) + logits.max(axis=-1, keepdims=True)
-    top_log_probs = top_logits - log_z
+    top_token_ids = np.asarray(top_token_ids, dtype=np.int64)
+    top_log_probs = np.asarray(top_log_probs, dtype=np.float32)
+    topk = min(int(budget), int(top_token_ids.shape[1]))
+    depth_limit = int(top_token_ids.shape[0])
 
     # Best-first heap search (Algorithm 1)
     # Heap entries: (-logw, ranks_tuple, parent_index, depth, rank, logw)
@@ -129,6 +112,53 @@ def build_ddtree_tree(
         child_maps=child_maps,
         visibility=visibility,
         node_count=node_count,
+    )
+
+
+def build_ddtree_tree(
+    draft_logits: np.ndarray,
+    budget: int,
+) -> DDTree:
+    """Build an optimal draft tree from block diffusion per-position logits.
+
+    Implements Algorithm 1 from the DDTree paper. Uses a max-heap keyed by
+    log-probability to greedily select the B highest-probability prefixes.
+
+    Args:
+        draft_logits: (L, vocab_size) float32 — per-position logits from
+            the DFlash draft model for positions 1..L after the bonus token.
+        budget: Maximum number of tree nodes (excluding root).
+
+    Returns:
+        DDTree namedtuple with tree structure and visibility matrix.
+    """
+    if budget <= 0 or draft_logits.shape[0] == 0:
+        return build_ddtree_tree_from_topk(
+            np.empty((0, 0), dtype=np.int64),
+            np.empty((0, 0), dtype=np.float32),
+            budget,
+        )
+
+    topk = min(budget, draft_logits.shape[-1])
+
+    # Compute top-K log-probabilities per position
+    logits = draft_logits.astype(np.float32)
+    # Partial sort for top-K indices
+    top_indices = np.argpartition(-logits, topk - 1, axis=-1)[:, :topk]
+    top_logits = np.take_along_axis(logits, top_indices, axis=-1)
+    # Sort within top-K for descending order
+    sort_order = np.argsort(-top_logits, axis=-1)
+    top_token_ids = np.take_along_axis(top_indices, sort_order, axis=-1)
+    top_logits = np.take_along_axis(top_logits, sort_order, axis=-1)
+
+    # Log-softmax for log-probabilities
+    log_z = np.log(np.sum(np.exp(logits - logits.max(axis=-1, keepdims=True)), axis=-1, keepdims=True)) + logits.max(axis=-1, keepdims=True)
+    top_log_probs = top_logits - log_z
+
+    return build_ddtree_tree_from_topk(
+        top_token_ids=top_token_ids,
+        top_log_probs=top_log_probs,
+        budget=budget,
     )
 
 

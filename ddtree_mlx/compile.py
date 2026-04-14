@@ -4,7 +4,7 @@ Compile a DDTree into MLX tensors for the verification forward pass.
 Takes the tree structure (Python/NumPy) and produces:
 - input_ids: token IDs for all tree nodes
 - position_ids: absolute positions for per-token RoPE
-- tree_attention_mask: additive mask for SDPA (tree visibility + prefix)
+- tree_attention_mask: additive tree-to-tree mask for SDPA
 - dfs_order / inv_dfs_order: reordering indices for linear layers
 """
 
@@ -23,7 +23,7 @@ class CompiledTree(NamedTuple):
 
     input_ids: mx.array       # (1, N+1) uint32 — root token + tree node tokens
     position_ids: mx.array    # (N+1,) int32 — absolute positions for RoPE
-    attention_mask: mx.array  # (1, 1, N+1, prefix_len + N+1) float32 — additive mask
+    attention_mask: mx.array  # (1, 1, N+1, N+1) float32 — tree-only additive mask
     dfs_order: mx.array       # (N+1,) int32 — indices to reorder to DFS
     inv_dfs_order: mx.array   # (N+1,) int32 — indices to reorder back from DFS
     tree_size: int             # N+1 (root + nodes)
@@ -60,14 +60,11 @@ def compile_tree(
         positions[1:] = prefix_len + tree.node_depths
     position_ids = mx.array(positions, dtype=mx.int32)
 
-    # 3. Attention mask: (tree_size, prefix_len + tree_size)
-    # Left part: all tree nodes can attend to entire prefix → True
-    # Right part: tree visibility matrix (ancestor-only)
-    # Convert to additive mask: True → 0.0, False → -inf
-    full_vis = np.ones((tree_size, prefix_len + tree_size), dtype=np.bool_)
-    full_vis[:, prefix_len:] = tree.visibility  # tree-to-tree visibility
-    mask = np.where(full_vis, 0.0, -np.inf).astype(np.float32)
-    attention_mask = mx.array(mask)[None, None, :, :]  # (1, 1, T, prefix+T)
+    # 3. Attention mask: tree-to-tree visibility only. Prefix attention is
+    # rebuilt in verify from the actual cache offset to avoid prefix-sized
+    # allocations during compile.
+    mask = np.where(tree.visibility, 0.0, -np.inf).astype(np.float32)
+    attention_mask = mx.array(mask)[None, None, :, :]  # (1, 1, T, T)
 
     # 4. DFS ordering for linear layers
     dfs, inv_dfs = compute_dfs_order(tree)

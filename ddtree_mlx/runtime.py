@@ -2,7 +2,7 @@
 DDTree generate loop for MLX.
 
 Orchestrates: draft → tree_build → tree_compile → tree_verify →
-tree_walk → commit (fast/slow path) → update.
+tree_walk → commit (fast prefix / exact suffix) → update.
 """
 
 from __future__ import annotations
@@ -14,14 +14,84 @@ from typing import Any, Optional
 import mlx.core as mx
 import numpy as np
 
-from .tree import build_ddtree_tree, follow_verified_tree, compute_dfs_order
-from .compile import compile_tree, is_dfs_prefix
+from .tree import DDTree, build_ddtree_tree_from_topk
+from .compile import compile_tree
 from .verify import tree_verify_forward
-from .cache import snapshot_caches, restore_caches, fast_path_commit, slow_path_commit
+from .cache import fast_path_commit
 
 
 # Default tree budget (configurable via env var or parameter)
 DEFAULT_TREE_BUDGET = int(os.environ.get("DDTREE_BUDGET", "16"))
+
+
+def _tree_token_id(tree: DDTree, root_token: int, tree_index: int) -> int:
+    if tree_index == 0:
+        return int(root_token)
+    return int(tree.node_token_ids[tree_index - 1])
+
+
+def _tree_token_ids(tree: DDTree, root_token: int, indices: list[int]) -> list[int]:
+    return [_tree_token_id(tree, root_token, idx) for idx in indices]
+
+
+def _build_tree_from_mlx_logits(
+    draft_logits: mx.array,
+    *,
+    budget: int,
+) -> DDTree:
+    """Build a DDTree while transferring only top-k draft data to CPU."""
+    if budget <= 0 or int(draft_logits.shape[0]) == 0:
+        return build_ddtree_tree_from_topk(
+            np.empty((0, 0), dtype=np.int64),
+            np.empty((0, 0), dtype=np.float32),
+            budget,
+        )
+
+    topk = min(int(budget), int(draft_logits.shape[-1]))
+    logits = draft_logits.astype(mx.float32)
+    top_indices = mx.argpartition(-logits, kth=topk - 1, axis=-1)[:, :topk]
+    top_logits = mx.take_along_axis(logits, top_indices, axis=-1)
+    sort_order = mx.argsort(-top_logits, axis=-1)
+    top_token_ids = mx.take_along_axis(top_indices, sort_order, axis=-1)
+    top_logits = mx.take_along_axis(top_logits, sort_order, axis=-1)
+    top_log_probs = top_logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    mx.eval(top_token_ids, top_log_probs)
+
+    return build_ddtree_tree_from_topk(
+        np.array(top_token_ids, copy=False),
+        np.array(top_log_probs, copy=False),
+        budget=budget,
+    )
+
+
+def _walk_dfs_exact_prefix(
+    child_maps: list[dict[int, int]],
+    posterior_tokens: list[int],
+    dfs_order: list[int],
+) -> tuple[list[int], int | None, int]:
+    """Walk while logits are exact for the DFS prefix.
+
+    Returns (accepted_indices, bonus_token, exact_prefix_len). When bonus_token
+    is None, the final accepted node is the first divergent child and must be
+    committed by standard forward before walking deeper.
+    """
+    accepted_indices = [0]
+    current_index = 0
+
+    while True:
+        next_token = int(posterior_tokens[current_index])
+        child_index = child_maps[current_index].get(next_token)
+        if child_index is None:
+            return accepted_indices, next_token, len(accepted_indices)
+
+        next_pos = len(accepted_indices)
+        if next_pos < len(dfs_order) and int(dfs_order[next_pos]) == child_index:
+            accepted_indices.append(child_index)
+            current_index = child_index
+            continue
+
+        accepted_indices.append(child_index)
+        return accepted_indices, None, next_pos
 
 
 def generate_ddtree_once(
@@ -60,7 +130,6 @@ def generate_ddtree_once(
         build_suppress_token_mask,
         _eval_logits_and_captured,
         _arm_target_rollback_with_prefix,
-        _restore_target_cache_after_acceptance,
     )
     from dflash_mlx.model import ContextOnlyDraftKVCache
 
@@ -118,6 +187,13 @@ def generate_ddtree_once(
     tree_build_ns = 0
     tree_verify_ns = 0
     commit_ns = 0
+    verify_linear_ns = 0
+    verify_attention_ns = 0
+    profile_verify = os.environ.get("DDTREE_PROFILE_VERIFY", "").lower() not in (
+        "",
+        "0",
+        "false",
+    )
 
     while len(generated_tokens) < max_new_tokens:
         remaining = max_new_tokens - len(generated_tokens)
@@ -152,7 +228,7 @@ def generate_ddtree_once(
                 cache=target_cache,
                 capture_layer_ids=capture_layer_ids,
             )
-            mx.eval(fwd_logits)
+            _eval_logits_and_captured(fwd_logits, fwd_hidden)
             target_hidden = extract_context_feature_from_dict(
                 fwd_hidden, list(draft_model.target_layer_ids)
             )
@@ -167,89 +243,147 @@ def generate_ddtree_once(
 
         # --- TREE BUILD ---
         build_start = time.perf_counter_ns()
-        draft_logits_np = np.array(draft_logits[0].astype(mx.float32), copy=False)
-        tree = build_ddtree_tree(draft_logits_np, budget=tree_budget)
+        draft_logits_2d = draft_logits[0].astype(mx.float32)
+        if suppress_mask is not None:
+            floor = mx.array(-1e9, dtype=draft_logits_2d.dtype)
+            draft_logits_2d = mx.where(suppress_mask, floor, draft_logits_2d)
+        tree = _build_tree_from_mlx_logits(draft_logits_2d, budget=tree_budget)
         root_token = int(staged_first.item())
         compiled = compile_tree(tree, root_token, prefix_len=start)
         dfs_order_list = compiled.dfs_order.tolist()
         tree_build_ns += time.perf_counter_ns() - build_start
 
-        # --- SNAPSHOT + ARM ROLLBACK ---
-        snapshots = snapshot_caches(target_cache)
+        # --- ARM ROLLBACK ---
         _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
 
         # --- TREE VERIFY ---
         verify_start = time.perf_counter_ns()
+        verify_profile = {} if profile_verify else None
         verify_logits, verify_hidden = tree_verify_forward(
             target_model,
             compiled_tree=compiled,
             cache=target_cache,
             capture_layer_ids=capture_layer_ids,
+            profile_timings=verify_profile,
         )
         mx.eval(verify_logits)
         tree_verify_ns += time.perf_counter_ns() - verify_start
+        if verify_profile is not None:
+            verify_linear_ns += verify_profile.get("linear_ns", 0)
+            verify_attention_ns += verify_profile.get("attention_ns", 0)
 
         # --- TREE WALK ---
-        posterior = mx.argmax(verify_logits[0], axis=-1)
+        posterior = greedy_tokens_with_mask(verify_logits[0], suppress_mask)
         posterior_list = posterior.tolist()
-        accepted_indices, bonus_token = follow_verified_tree(
-            tree.child_maps, posterior_list
+        accepted_indices, bonus_token, exact_prefix_len = _walk_dfs_exact_prefix(
+            tree.child_maps, posterior_list, dfs_order_list
         )
-        n_accepted = len(accepted_indices)  # includes root
-        acceptance_history.append(n_accepted)
-
-        # Collect accepted token IDs (root + accepted nodes)
-        accepted_token_ids_list = [root_token]
-        for idx in accepted_indices[1:]:
-            accepted_token_ids_list.append(int(tree.node_token_ids[idx - 1]))
 
         # --- COMMIT ---
         commit_start = time.perf_counter_ns()
-        use_fast_path = is_dfs_prefix(accepted_indices, dfs_order_list)
+        all_hidden = extract_context_feature_from_dict(
+            verify_hidden, list(draft_model.target_layer_ids)
+        )
+        use_fast_path = exact_prefix_len == len(accepted_indices)
 
         if use_fast_path:
             fast_path_count += 1
-            fast_path_commit(target_cache, prefix_len=start, n_accepted=n_accepted)
-            # Use hidden states captured during tree verify
-            committed_hidden = extract_context_feature_from_dict(
-                verify_hidden, list(draft_model.target_layer_ids)
+            fast_path_commit(
+                target_cache,
+                prefix_len=start,
+                n_accepted=len(accepted_indices),
             )
-            # Select only accepted indices
+            # Use hidden states captured during tree verify
             accepted_idx_array = mx.array(accepted_indices, dtype=mx.int32)
-            committed_hidden = committed_hidden[:, accepted_idx_array, :]
+            committed_hidden = all_hidden[:, accepted_idx_array, :]
         else:
             slow_path_count += 1
-            accepted_ids_mx = mx.array(
-                accepted_token_ids_list, dtype=mx.uint32
-            )[None]
-            _, committed_hidden_raw = slow_path_commit(
-                target_model,
+            fast_path_commit(
                 target_cache,
-                snapshots,
-                accepted_ids_mx,
+                prefix_len=start,
+                n_accepted=exact_prefix_len,
+            )
+            prefix_indices = accepted_indices[:exact_prefix_len]
+            prefix_idx_array = mx.array(prefix_indices, dtype=mx.int32)
+            hidden_chunks = [all_hidden[:, prefix_idx_array, :]]
+
+            suffix_indices = accepted_indices[exact_prefix_len:]
+            suffix_ids = _tree_token_ids(tree, root_token, suffix_indices)
+            suffix_ids_mx = mx.array(suffix_ids, dtype=mx.uint32)[None]
+            suffix_logits, suffix_hidden_raw = target_forward_with_hidden_states(
+                target_model,
+                input_ids=suffix_ids_mx,
+                cache=target_cache,
                 capture_layer_ids=capture_layer_ids,
             )
-            committed_hidden = extract_context_feature_from_dict(
-                committed_hidden_raw, list(draft_model.target_layer_ids)
+            _eval_logits_and_captured(suffix_logits, suffix_hidden_raw)
+            hidden_chunks.append(
+                extract_context_feature_from_dict(
+                    suffix_hidden_raw, list(draft_model.target_layer_ids)
+                )
+            )
+            current_index = accepted_indices[-1]
+            next_token = int(
+                greedy_tokens_with_mask(suffix_logits[:, -1, :], suppress_mask).item()
+            )
+
+            while (
+                next_token in tree.child_maps[current_index]
+                and len(accepted_indices) < block_len
+            ):
+                current_index = tree.child_maps[current_index][next_token]
+                accepted_indices.append(current_index)
+                token_ids_mx = mx.array([[next_token]], dtype=mx.uint32)
+                suffix_logits, suffix_hidden_raw = target_forward_with_hidden_states(
+                    target_model,
+                    input_ids=token_ids_mx,
+                    cache=target_cache,
+                    capture_layer_ids=capture_layer_ids,
+                )
+                _eval_logits_and_captured(suffix_logits, suffix_hidden_raw)
+                hidden_chunks.append(
+                    extract_context_feature_from_dict(
+                        suffix_hidden_raw, list(draft_model.target_layer_ids)
+                    )
+                )
+                next_token = int(
+                    greedy_tokens_with_mask(
+                        suffix_logits[:, -1, :], suppress_mask
+                    ).item()
+                )
+
+            bonus_token = next_token
+            committed_hidden = (
+                mx.concatenate(hidden_chunks, axis=1)
+                if len(hidden_chunks) > 1
+                else hidden_chunks[0]
             )
 
         mx.eval(committed_hidden)
         commit_ns += time.perf_counter_ns() - commit_start
 
         # --- UPDATE ---
-        # Add accepted tokens + bonus to generated output
-        generated_tokens.extend(accepted_token_ids_list)
-        generated_tokens.append(bonus_token)
-        start += n_accepted + 1  # +1 for bonus token
+        # Add accepted tokens to generated output. The bonus is staged for the
+        # next cycle and is not in target cache yet.
+        accepted_token_ids_list = _tree_token_ids(tree, root_token, accepted_indices)
+        n_accepted = len(accepted_indices)  # includes root
+        acceptance_history.append(n_accepted)
+        emitted_token_ids = accepted_token_ids_list
+        stop_hit = False
+        if stop_token_array is not None:
+            for pos, token_id in enumerate(accepted_token_ids_list):
+                if token_id in stop_token_ids:
+                    emitted_token_ids = accepted_token_ids_list[: pos + 1]
+                    stop_hit = True
+                    break
+        generated_tokens.extend(emitted_token_ids)
+        start += n_accepted
         target_hidden = committed_hidden
         staged_first = mx.array([bonus_token], dtype=mx.uint32)
         cycles_completed += 1
 
-        # Check stop tokens
-        if stop_token_array is not None:
-            for t in accepted_token_ids_list + [bonus_token]:
-                if t in stop_token_ids:
-                    break
+        if stop_hit:
+            break
 
     # Trim to max_new_tokens
     generated_tokens = generated_tokens[:max_new_tokens]
@@ -261,6 +395,16 @@ def generate_ddtree_once(
 
     elapsed_us = (time.perf_counter_ns() - start_ns) / 1_000.0
     gen_count = len(generated_tokens)
+    phase_timings = {
+        "prefill": prefill_ns / 1_000.0,
+        "draft": draft_ns / 1_000.0,
+        "tree_build": tree_build_ns / 1_000.0,
+        "tree_verify": tree_verify_ns / 1_000.0,
+        "commit": commit_ns / 1_000.0,
+    }
+    if profile_verify:
+        phase_timings["tree_verify_linear"] = verify_linear_ns / 1_000.0
+        phase_timings["tree_verify_attention"] = verify_attention_ns / 1_000.0
 
     return {
         "generated_token_ids": generated_tokens,
@@ -282,12 +426,6 @@ def generate_ddtree_once(
             if (fast_path_count + slow_path_count) > 0
             else 0
         ),
-        "phase_timings_us": {
-            "prefill": prefill_ns / 1_000.0,
-            "draft": draft_ns / 1_000.0,
-            "tree_build": tree_build_ns / 1_000.0,
-            "tree_verify": tree_verify_ns / 1_000.0,
-            "commit": commit_ns / 1_000.0,
-        },
+        "phase_timings_us": phase_timings,
         "tree_budget": tree_budget,
     }
