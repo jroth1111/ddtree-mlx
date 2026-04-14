@@ -167,7 +167,7 @@ def generate_ddtree_once(
 
         # --- TREE BUILD ---
         build_start = time.perf_counter_ns()
-        draft_logits_np = np.array(draft_logits[0], copy=False)
+        draft_logits_np = np.array(draft_logits[0].astype(mx.float32), copy=False)
         tree = build_ddtree_tree(draft_logits_np, budget=tree_budget)
         root_token = int(staged_first.item())
         compiled = compile_tree(tree, root_token, prefix_len=start)
