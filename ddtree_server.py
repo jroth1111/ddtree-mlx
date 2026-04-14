@@ -2,7 +2,7 @@
 FastAPI server for DDTree-MLX — OpenAI-compatible endpoint.
 
 Usage:
-    python3.12 ddtree_server.py [--port 8006] [--model mlx-community/Qwen3.5-27B-4bit] [--tree-budget 16]
+    python3.12 ddtree_server.py [--port 8006] [--model mlx-community/Qwen3.5-27B-4bit] [--tree-budget 8]
 """
 
 import argparse
@@ -85,7 +85,7 @@ async def chat_completions(request: Request):
         prompt_tokens = list(tokenizer.encode(prompt))
 
     max_tokens = int(payload.get("max_tokens", 2048))
-    tree_budget = int(payload.get("tree_budget", STATE.get("tree_budget", 16)))
+    tree_budget = int(payload.get("tree_budget", STATE.get("tree_budget", 8)))
     stop_token_ids = get_stop_token_ids(tokenizer)
     response_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -127,6 +127,8 @@ async def chat_completions(request: Request):
             "avg_acceptance": summary.get("avg_acceptance", 0),
             "fast_path_ratio": summary.get("fast_path_ratio", 0),
             "tok_per_sec": summary.get("tokens_per_second", 0),
+            "tree_aware_linear": summary.get("tree_aware_linear", False),
+            "tree_aware_commit_count": summary.get("tree_aware_commit_count", 0),
         },
     }
 
@@ -137,7 +139,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--model", default="mlx-community/Qwen3.5-27B-4bit")
     parser.add_argument("--draft", default=None)
-    parser.add_argument("--tree-budget", type=int, default=16)
+    parser.add_argument("--tree-budget", type=int, default=8)
     args = parser.parse_args()
 
     print(f"Loading {args.model}...")

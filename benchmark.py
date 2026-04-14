@@ -2,7 +2,7 @@
 Benchmark DDTree-MLX vs DFlash baseline.
 
 Usage:
-    python3.12 benchmark.py [--max-tokens 4096] [--budgets 16,32,64]
+    python3.12 benchmark.py [--max-tokens 4096] [--budgets 8,16,24]
 """
 
 import argparse
@@ -63,7 +63,7 @@ def main():
     parser.add_argument("--model", default="mlx-community/Qwen3.5-27B-4bit")
     parser.add_argument("--draft", default=None)
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--budgets", default="16,32,64")
+    parser.add_argument("--budgets", default="8,16,24")
     parser.add_argument("--prompts", type=int, default=3, help="Number of prompts to test")
     parser.add_argument("--output", default=None, help="JSON output file")
     args = parser.parse_args()
@@ -146,6 +146,10 @@ def main():
                     "avg_acceptance": round(avg_accept, 2),
                     "fast_path_ratio": round(fast_ratio, 3),
                     "speedup_vs_dflash": round(speedup, 3),
+                    "tree_aware_linear": ddtree_result.get("tree_aware_linear", False),
+                    "tree_aware_commit_count": ddtree_result.get(
+                        "tree_aware_commit_count", 0
+                    ),
                     "phase_timings_us": ddtree_result.get("phase_timings_us", {}),
                 })
             except Exception as e:
