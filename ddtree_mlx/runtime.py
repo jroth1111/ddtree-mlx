@@ -2,7 +2,7 @@
 DDTree generate loop for MLX.
 
 Orchestrates: draft → tree_build → tree_compile → tree_verify →
-tree_walk → commit (fast prefix / exact suffix) → update.
+tree_walk → commit (tree-aware exact path or legacy prefix/suffix) → update.
 """
 
 from __future__ import annotations
@@ -14,14 +14,14 @@ from typing import Any, Optional
 import mlx.core as mx
 import numpy as np
 
-from .tree import DDTree, build_ddtree_tree_from_topk
+from .tree import DDTree, build_ddtree_tree_from_topk, follow_verified_tree
 from .compile import compile_tree
 from .verify import tree_verify_forward
-from .cache import fast_path_commit
+from .cache import fast_path_commit, tree_aware_path_commit
 
 
 # Default tree budget (configurable via env var or parameter)
-DEFAULT_TREE_BUDGET = int(os.environ.get("DDTREE_BUDGET", "16"))
+DEFAULT_TREE_BUDGET = int(os.environ.get("DDTREE_BUDGET", "8"))
 
 
 def _tree_token_id(tree: DDTree, root_token: int, tree_index: int) -> int:
@@ -194,6 +194,12 @@ def generate_ddtree_once(
         "0",
         "false",
     )
+    tree_aware_linear = os.environ.get("DDTREE_TREE_AWARE_LINEAR", "1").lower() not in (
+        "",
+        "0",
+        "false",
+    )
+    tree_aware_commit_count = 0
 
     while len(generated_tokens) < max_new_tokens:
         remaining = max_new_tokens - len(generated_tokens)
@@ -254,17 +260,21 @@ def generate_ddtree_once(
         tree_build_ns += time.perf_counter_ns() - build_start
 
         # --- ARM ROLLBACK ---
-        _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
+        if not tree_aware_linear:
+            _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
 
         # --- TREE VERIFY ---
         verify_start = time.perf_counter_ns()
         verify_profile = {} if profile_verify else None
+        tree_cache_state: dict[str, Any] | None = {} if tree_aware_linear else None
         verify_logits, verify_hidden = tree_verify_forward(
             target_model,
             compiled_tree=compiled,
             cache=target_cache,
             capture_layer_ids=capture_layer_ids,
             profile_timings=verify_profile,
+            tree_aware_linear=tree_aware_linear,
+            tree_cache_state=tree_cache_state,
         )
         mx.eval(verify_logits)
         tree_verify_ns += time.perf_counter_ns() - verify_start
@@ -275,18 +285,42 @@ def generate_ddtree_once(
         # --- TREE WALK ---
         posterior = greedy_tokens_with_mask(verify_logits[0], suppress_mask)
         posterior_list = posterior.tolist()
-        accepted_indices, bonus_token, exact_prefix_len = _walk_dfs_exact_prefix(
-            tree.child_maps, posterior_list, dfs_order_list
-        )
+        if tree_aware_linear:
+            accepted_indices, bonus_token = follow_verified_tree(
+                tree.child_maps, posterior_list
+            )
+            exact_prefix_len = len(accepted_indices)
+        else:
+            accepted_indices, bonus_token, exact_prefix_len = _walk_dfs_exact_prefix(
+                tree.child_maps, posterior_list, dfs_order_list
+            )
 
         # --- COMMIT ---
         commit_start = time.perf_counter_ns()
         all_hidden = extract_context_feature_from_dict(
             verify_hidden, list(draft_model.target_layer_ids)
         )
-        use_fast_path = exact_prefix_len == len(accepted_indices)
+        use_fast_path = (
+            accepted_indices == dfs_order_list[: len(accepted_indices)]
+            if tree_aware_linear
+            else exact_prefix_len == len(accepted_indices)
+        )
 
-        if use_fast_path:
+        if tree_aware_linear:
+            tree_aware_commit_count += 1
+            tree_aware_path_commit(
+                target_cache,
+                prefix_len=start,
+                accepted_indices=accepted_indices,
+                tree_cache_state=tree_cache_state or {},
+            )
+            accepted_idx_array = mx.array(accepted_indices, dtype=mx.int32)
+            committed_hidden = all_hidden[:, accepted_idx_array, :]
+            if use_fast_path:
+                fast_path_count += 1
+            else:
+                slow_path_count += 1
+        elif use_fast_path:
             fast_path_count += 1
             fast_path_commit(
                 target_cache,
@@ -421,6 +455,8 @@ def generate_ddtree_once(
         ),
         "fast_path_count": fast_path_count,
         "slow_path_count": slow_path_count,
+        "tree_aware_commit_count": tree_aware_commit_count,
+        "tree_aware_linear": tree_aware_linear,
         "fast_path_ratio": (
             fast_path_count / (fast_path_count + slow_path_count)
             if (fast_path_count + slow_path_count) > 0

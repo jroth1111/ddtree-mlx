@@ -2,10 +2,12 @@
 Cache management for DDTree: snapshot, restore, and commit.
 
 Two commit strategies:
-- FAST PATH: accepted path is a DFS prefix → use tape rollback for linear layers,
-  index-select for attention KV cache. No re-forward needed.
-- LEGACY SLOW PATH: restore caches from lazy snapshot and re-forward accepted
-  tokens through the standard model path.
+- TREE-AWARE PATH: commit any accepted tree path by packing attention KV cache
+  entries and installing the exact per-node recurrent state.
+- LEGACY FAST PATH: accepted path is a DFS prefix → use tape rollback for linear
+  layers and trim attention KV cache. No re-forward needed.
+- LEGACY SLOW PATH: re-forward accepted suffix tokens through the standard model
+  path after the exact DFS prefix.
 """
 
 from __future__ import annotations
@@ -88,6 +90,63 @@ def fast_path_commit(
             offset = int(getattr(cache_entry, "offset", 0) or 0)
             if offset > target_len:
                 cache_entry.offset = target_len
+
+
+def _clear_rollback_state(cache_entry: Any) -> None:
+    for name in ("_armed",):
+        if hasattr(cache_entry, name):
+            setattr(cache_entry, name, False)
+    for name in ("_tape", "_tape_k", "_tape_g", "_tape_qkv", "_snapshot"):
+        if hasattr(cache_entry, name):
+            setattr(cache_entry, name, None)
+
+
+def tree_aware_path_commit(
+    cache_entries: list[Any],
+    *,
+    prefix_len: int,
+    accepted_indices: list[int],
+    tree_cache_state: dict[str, Any],
+) -> None:
+    """Commit an arbitrary accepted tree path from tree-aware verification.
+
+    Attention KV entries are appended during verify in tree-index order. This
+    packs only the accepted path after the prefix. Linear recurrent caches are
+    set to the exact per-node state captured for the final accepted node.
+    """
+    if not accepted_indices:
+        return
+
+    target_len = int(prefix_len) + len(accepted_indices)
+    source_positions = mx.array(
+        [int(prefix_len) + int(idx) for idx in accepted_indices],
+        dtype=mx.int32,
+    )
+    linear_states = tree_cache_state.get("linear_layers", {})
+
+    for layer_idx, cache_entry in enumerate(cache_entries):
+        layer_state = linear_states.get(layer_idx)
+        if layer_state is not None and hasattr(cache_entry, "state"):
+            final_index = int(accepted_indices[-1])
+            cache_entry.state = [
+                layer_state["conv_states"][final_index : final_index + 1],
+                layer_state["states"][final_index : final_index + 1],
+            ]
+            _clear_rollback_state(cache_entry)
+            continue
+
+        if hasattr(cache_entry, "keys") and hasattr(cache_entry, "values"):
+            keys = getattr(cache_entry, "keys", None)
+            values = getattr(cache_entry, "values", None)
+            if keys is not None and values is not None:
+                selected_keys = mx.take(keys, source_positions, axis=2)
+                selected_values = mx.take(values, source_positions, axis=2)
+                cache_entry.keys[..., prefix_len:target_len, :] = selected_keys
+                cache_entry.values[..., prefix_len:target_len, :] = selected_values
+            if hasattr(cache_entry, "offset"):
+                cache_entry.offset = target_len
+        elif hasattr(cache_entry, "offset"):
+            cache_entry.offset = target_len
 
 
 def slow_path_commit(

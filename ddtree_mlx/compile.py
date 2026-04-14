@@ -26,6 +26,8 @@ class CompiledTree(NamedTuple):
     attention_mask: mx.array  # (1, 1, N+1, N+1) float32 — tree-only additive mask
     dfs_order: mx.array       # (N+1,) int32 — indices to reorder to DFS
     inv_dfs_order: mx.array   # (N+1,) int32 — indices to reorder back from DFS
+    parents: list[int]        # (N+1,) — parent tree index for each node
+    depths: list[int]         # (N+1,) — root depth 0, drafted nodes 1..L
     tree_size: int             # N+1 (root + nodes)
 
 
@@ -59,6 +61,9 @@ def compile_tree(
     if tree.node_count > 0:
         positions[1:] = prefix_len + tree.node_depths
     position_ids = mx.array(positions, dtype=mx.int32)
+    depths = [0]
+    if tree.node_count > 0:
+        depths.extend(int(depth) for depth in tree.node_depths.tolist())
 
     # 3. Attention mask: tree-to-tree visibility only. Prefix attention is
     # rebuilt in verify from the actual cache offset to avoid prefix-sized
@@ -77,6 +82,8 @@ def compile_tree(
         attention_mask=attention_mask,
         dfs_order=dfs_order,
         inv_dfs_order=inv_dfs_order,
+        parents=list(tree.parents),
+        depths=depths,
         tree_size=tree_size,
     )
 
