@@ -4,8 +4,8 @@ Cache management for DDTree: snapshot, restore, and commit.
 Two commit strategies:
 - FAST PATH: accepted path is a DFS prefix → use tape rollback for linear layers,
   index-select for attention KV cache. No re-forward needed.
-- SLOW PATH: accepted path is NOT a DFS prefix → restore all caches from snapshot,
-  re-forward accepted tokens through standard model path.
+- LEGACY SLOW PATH: restore caches from lazy snapshot and re-forward accepted
+  tokens through the standard model path.
 """
 
 from __future__ import annotations
@@ -16,26 +16,29 @@ import mlx.core as mx
 
 
 def snapshot_caches(cache_entries: list[Any]) -> list[Any]:
-    """Take a deep snapshot of all cache states before tree verification.
+    """Take a lazy snapshot of all cache states before tree verification.
 
     Returns a list of snapshots that can be restored via restore_caches.
     """
     snapshots = []
     for cache_entry in cache_entries:
-        if hasattr(cache_entry, "state"):
+        if hasattr(cache_entry, "rollback"):
+            # RecurrentRollbackCache replaces its state arrays during verify, so
+            # saving references is enough and avoids copying every linear state.
+            snapshots.append(("state_refs", list(cache_entry.state)))
+        elif hasattr(cache_entry, "offset"):
+            # KVCache writes new entries at/after offset. Restoring only the
+            # offset makes appended tree nodes invisible and future writes
+            # overwrite them.
+            snapshots.append(("offset", int(cache_entry.offset or 0)))
+        elif hasattr(cache_entry, "state"):
             state = cache_entry.state
             if isinstance(state, list):
-                # ArraysCache: list of arrays
-                snapshots.append([mx.array(s) if s is not None else None for s in state])
+                snapshots.append(("state_refs", list(state)))
             elif isinstance(state, tuple):
-                # KVCache: (keys, values) tuple
-                k, v = state
-                snapshots.append((mx.array(k), mx.array(v)) if k is not None else None)
+                snapshots.append(("state_refs", state))
             else:
                 snapshots.append(None)
-        elif hasattr(cache_entry, "offset"):
-            # Just save offset for basic caches
-            snapshots.append(cache_entry.offset)
         else:
             snapshots.append(None)
     return snapshots
@@ -46,13 +49,21 @@ def restore_caches(cache_entries: list[Any], snapshots: list[Any]) -> None:
     for cache_entry, snap in zip(cache_entries, snapshots):
         if snap is None:
             continue
-        if hasattr(cache_entry, "state"):
-            if isinstance(snap, list):
-                # ArraysCache
-                cache_entry.state = snap
-            elif isinstance(snap, tuple):
-                # KVCache
-                cache_entry.state = snap
+        if (
+            isinstance(snap, tuple)
+            and len(snap) == 2
+            and isinstance(snap[0], str)
+        ):
+            kind, value = snap
+            if kind == "offset" and hasattr(cache_entry, "offset"):
+                cache_entry.offset = int(value)
+            elif kind == "state_refs" and hasattr(cache_entry, "state"):
+                cache_entry.state = list(value) if isinstance(value, list) else value
+            continue
+
+        # Backward-compatible restore for snapshots created by older code.
+        if hasattr(cache_entry, "state") and isinstance(snap, (list, tuple)):
+            cache_entry.state = snap
         elif hasattr(cache_entry, "offset") and isinstance(snap, int):
             cache_entry.offset = snap
 

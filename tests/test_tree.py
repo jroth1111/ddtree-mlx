@@ -1,6 +1,9 @@
 """Tests for DDTree tree building and walking."""
 
 import numpy as np
+import mlx.core as mx
+from ddtree_mlx.compile import compile_tree
+from ddtree_mlx.runtime import _build_tree_from_mlx_logits, _walk_dfs_exact_prefix
 from ddtree_mlx.tree import build_ddtree_tree, follow_verified_tree, compute_dfs_order
 
 
@@ -149,6 +152,75 @@ def test_budget_respected():
         assert tree.node_count <= budget
 
 
+def test_budget_equal_vocab():
+    """Tree build should support top-k equal to vocab size."""
+    logits = np.random.randn(3, 16).astype(np.float32)
+    tree = build_ddtree_tree(logits, budget=16)
+    assert tree.node_count == 16
+
+
+def test_compile_tree_mask_is_tree_only():
+    logits = np.random.randn(3, 50).astype(np.float32)
+    tree = build_ddtree_tree(logits, budget=4)
+    compiled = compile_tree(tree, root_token_id=1, prefix_len=128)
+    assert compiled.attention_mask.shape == (1, 1, 5, 5)
+
+
+def test_mlx_tree_build_matches_numpy_tree_build():
+    np.random.seed(7)
+    logits = np.random.randn(4, 64).astype(np.float32)
+    numpy_tree = build_ddtree_tree(logits, budget=8)
+    mlx_tree = _build_tree_from_mlx_logits(mx.array(logits), budget=8)
+    assert mlx_tree.node_token_ids.tolist() == numpy_tree.node_token_ids.tolist()
+    assert mlx_tree.node_depths.tolist() == numpy_tree.node_depths.tolist()
+    assert mlx_tree.parents == numpy_tree.parents
+
+
+def test_walk_dfs_exact_prefix_fast_path():
+    np.random.seed(42)
+    logits = np.random.randn(3, 100).astype(np.float32)
+    tree = build_ddtree_tree(logits, budget=8)
+    dfs_order, _ = compute_dfs_order(tree)
+
+    posterior = [-1] * (1 + tree.node_count)
+    first_child = dfs_order[1]
+    posterior[0] = int(tree.node_token_ids[first_child - 1])
+    posterior[first_child] = 99999
+
+    accepted, bonus, exact_prefix_len = _walk_dfs_exact_prefix(
+        tree.child_maps, posterior, dfs_order
+    )
+    assert accepted == [0, first_child]
+    assert bonus == 99999
+    assert exact_prefix_len == len(accepted)
+
+
+def test_walk_dfs_exact_prefix_divergence():
+    logits = np.array(
+        [
+            [10, 9, 8, 7, 6],
+            [10, 9, 8, 7, 6],
+            [10, 9, 8, 7, 6],
+        ],
+        dtype=np.float32,
+    )
+    tree = build_ddtree_tree(logits, budget=4)
+    dfs_order, _ = compute_dfs_order(tree)
+
+    root_children = list(tree.child_maps[0].values())
+    assert len(root_children) >= 2
+    divergent_child = root_children[1]
+    posterior = [-1] * (1 + tree.node_count)
+    posterior[0] = int(tree.node_token_ids[divergent_child - 1])
+
+    accepted, bonus, exact_prefix_len = _walk_dfs_exact_prefix(
+        tree.child_maps, posterior, dfs_order
+    )
+    assert accepted == [0, divergent_child]
+    assert bonus is None
+    assert exact_prefix_len == 1
+
+
 if __name__ == "__main__":
     test_empty_budget()
     test_empty_logits()
@@ -158,4 +230,9 @@ if __name__ == "__main__":
     test_follow_verified_tree_immediate_reject()
     test_dfs_order()
     test_budget_respected()
+    test_budget_equal_vocab()
+    test_compile_tree_mask_is_tree_only()
+    test_mlx_tree_build_matches_numpy_tree_build()
+    test_walk_dfs_exact_prefix_fast_path()
+    test_walk_dfs_exact_prefix_divergence()
     print("All tree tests passed!")
