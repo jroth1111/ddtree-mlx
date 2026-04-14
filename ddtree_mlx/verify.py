@@ -18,6 +18,12 @@ import mlx.nn as nn
 
 from .compile import CompiledTree
 
+# Use dflash-mlx's model navigation helpers (handles VL models, nested wrappers)
+from dflash_mlx.runtime import (
+    _target_text_model,
+    _lm_head_logits,
+)
+
 
 def _rope_with_positions(
     x: mx.array,
@@ -81,7 +87,19 @@ def _attention_forward_with_tree(
     if cache is not None:
         keys, values = cache.update_and_fetch(keys, values)
 
-    # SDPA with tree attention mask
+    # SDPA with tree attention mask — mask must cover full KV length
+    kv_len = keys.shape[2]
+    mask_kv_len = mask.shape[-1]
+    if mask_kv_len != kv_len:
+        # Pad or trim mask to match actual KV cache length
+        if mask_kv_len < kv_len:
+            # KV cache has more entries than expected — extend mask with zeros (attend)
+            pad = mx.zeros((mask.shape[0], mask.shape[1], mask.shape[2], kv_len - mask_kv_len), dtype=mask.dtype)
+            mask = mx.concatenate([pad, mask], axis=-1)
+        else:
+            # Mask is too wide — trim from the left (prefix side)
+            mask = mask[:, :, :, mask_kv_len - kv_len:]
+
     output = mx.fast.scaled_dot_product_attention(
         queries, keys, values, scale=attn.scale, mask=mask
     )
@@ -116,11 +134,20 @@ def tree_verify_forward(
     """
     ct = compiled_tree
 
-    # Get model internals
-    inner = target_model.model if hasattr(target_model, "model") else target_model
-    # Handle nested model (e.g., Model.model.model for VL models)
-    if hasattr(inner, "model") and hasattr(inner.model, "layers"):
-        inner = inner.model
+    # Get model internals (handles VL models, nested wrappers)
+    inner = _target_text_model(target_model)
+
+    # Find actual KV cache offset from an attention layer cache
+    fa_idx = getattr(inner, "fa_idx", None)
+    if fa_idx is not None and cache[fa_idx] is not None:
+        actual_prefix = int(getattr(cache[fa_idx], "offset", 0) or 0)
+    else:
+        # Fallback: find first KVCache
+        actual_prefix = 0
+        for c in cache:
+            if hasattr(c, "offset") and not hasattr(c, "cache"):
+                actual_prefix = int(c.offset or 0)
+                break
 
     # Reorder tokens and mask to DFS order
     dfs = ct.dfs_order
@@ -133,17 +160,19 @@ def tree_verify_forward(
     # Reorder position_ids to DFS order
     position_ids_dfs = ct.position_ids[dfs]
 
-    # Reorder attention mask to DFS order
-    # Original mask: (1, 1, tree_size, prefix + tree_size) in tree-index order
-    # We need to reorder both query (dim 2) and tree-key (dim 3, last tree_size cols)
-    prefix_len = ct.attention_mask.shape[-1] - ct.tree_size
-    prefix_mask = ct.attention_mask[:, :, :, :prefix_len]  # (1, 1, T, prefix)
-    tree_mask = ct.attention_mask[:, :, :, prefix_len:]    # (1, 1, T, T)
+    # Build attention mask from tree visibility, using actual cache prefix length
+    # Tree visibility (tree-index order): (N+1, N+1) bool
+    tree_vis = ct.attention_mask[:, :, :, -ct.tree_size:]  # extract tree-to-tree part
 
-    # Reorder: queries in DFS order, keys in DFS order
-    prefix_mask_dfs = prefix_mask[:, :, dfs, :]
-    tree_mask_dfs = tree_mask[:, :, dfs, :][:, :, :, dfs]
-    mask_dfs = mx.concatenate([prefix_mask_dfs, tree_mask_dfs], axis=-1)
+    # Reorder to DFS order
+    tree_vis_dfs = tree_vis[:, :, dfs, :][:, :, :, dfs]
+
+    # All tree nodes attend to entire prefix → zeros (attend)
+    # Use actual_prefix from cache, not compiled prefix_len
+    prefix_mask_dfs = mx.zeros((1, 1, ct.tree_size, actual_prefix), dtype=mx.float32)
+
+    mask_dfs = mx.concatenate([prefix_mask_dfs, tree_vis_dfs], axis=-1)
+    mask_dfs = mask_dfs.astype(h.dtype)
 
     # SSM mask for linear layers (None for standard ArraysCache)
     ssm_cache_idx = getattr(inner, "ssm_idx", 0)
@@ -183,11 +212,6 @@ def tree_verify_forward(
     # Reorder back to tree-index order for logits
     normalized = normalized[:, inv_dfs, :]
 
-    if hasattr(target_model, "lm_head"):
-        logits = target_model.lm_head(normalized)
-    elif hasattr(target_model, "args") and target_model.args.tie_word_embeddings:
-        logits = inner.embed_tokens.as_linear(normalized)
-    else:
-        logits = target_model.lm_head(normalized)
+    logits = _lm_head_logits(target_model, normalized)
 
     return logits, captured
