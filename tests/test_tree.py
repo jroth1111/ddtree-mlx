@@ -2,8 +2,18 @@
 
 import numpy as np
 import mlx.core as mx
+from mlx_lm.models.cache import ArraysCache
+from mlx_lm.models.qwen3_5 import GatedDeltaNet, TextModel, TextModelArgs
+from dflash_mlx.runtime import make_target_cache, target_forward_with_hidden_states
+import ddtree_mlx.verify as verify_module
+from ddtree_mlx.cache import tree_aware_path_commit
 from ddtree_mlx.compile import compile_tree
 from ddtree_mlx.runtime import _build_tree_from_mlx_logits, _walk_dfs_exact_prefix
+from ddtree_mlx.verify import (
+    _linear_forward_tree_aware,
+    _tree_depth_groups,
+    tree_verify_forward,
+)
 from ddtree_mlx.tree import build_ddtree_tree, follow_verified_tree, compute_dfs_order
 
 
@@ -221,6 +231,223 @@ def test_walk_dfs_exact_prefix_divergence():
     assert exact_prefix_len == 1
 
 
+def test_tree_aware_gated_delta_matches_chain_forward():
+    args = TextModelArgs(
+        hidden_size=8,
+        linear_num_value_heads=2,
+        linear_num_key_heads=1,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=2,
+    )
+    linear = GatedDeltaNet(args)
+    inputs = mx.random.normal((1, 4, 8))
+
+    seq_cache = ArraysCache(size=2)
+    seq_out = linear(inputs, cache=seq_cache)
+
+    tree_cache = ArraysCache(size=2)
+    parents = [-1, 0, 1, 2]
+    depths = [0, 1, 2, 3]
+    tree_out, node_states, node_conv_states = _linear_forward_tree_aware(
+        linear,
+        inputs,
+        tree_cache,
+        parents=parents,
+        depth_groups=_tree_depth_groups(depths),
+    )
+    mx.eval(seq_out, tree_out, node_states, node_conv_states)
+
+    assert np.max(np.abs(np.array(seq_out - tree_out))) < 1e-4
+    assert np.max(np.abs(np.array(seq_cache[0] - node_conv_states[-1:]))) < 1e-4
+    assert np.max(np.abs(np.array(seq_cache[1] - node_states[-1:]))) < 1e-4
+
+
+def test_tree_aware_gated_delta_forks_branch_state():
+    args = TextModelArgs(
+        hidden_size=8,
+        linear_num_value_heads=2,
+        linear_num_key_heads=1,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=2,
+    )
+    linear = GatedDeltaNet(args)
+    inputs = mx.random.normal((1, 3, 8))
+
+    tree_out, _, _ = _linear_forward_tree_aware(
+        linear,
+        inputs,
+        ArraysCache(size=2),
+        parents=[-1, 0, 0],
+        depth_groups=_tree_depth_groups([0, 1, 1]),
+    )
+
+    path_01 = mx.take(inputs, mx.array([0, 1], dtype=mx.int32), axis=1)
+    path_02 = mx.take(inputs, mx.array([0, 2], dtype=mx.int32), axis=1)
+    out_01 = linear(path_01, cache=ArraysCache(size=2))
+    out_02 = linear(path_02, cache=ArraysCache(size=2))
+    mx.eval(tree_out, out_01, out_02)
+
+    assert np.max(np.abs(np.array(tree_out[:, 0, :] - out_01[:, 0, :]))) < 1e-4
+    assert np.max(np.abs(np.array(tree_out[:, 1, :] - out_01[:, 1, :]))) < 1e-4
+    assert np.max(np.abs(np.array(tree_out[:, 2, :] - out_02[:, 1, :]))) < 1e-4
+
+
+def test_tree_aware_gated_delta_kernel_matches_fallback():
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return
+
+    args = TextModelArgs(
+        hidden_size=64,
+        linear_num_value_heads=2,
+        linear_num_key_heads=1,
+        linear_key_head_dim=32,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=2,
+    )
+    linear = GatedDeltaNet(args)
+    inputs = mx.random.normal((1, 6, 64))
+    parents = [-1, 0, 0, 1, 1, 2]
+    depths = [0, 1, 1, 2, 2, 2]
+    depth_groups = _tree_depth_groups(depths)
+
+    old_kernel_flag = verify_module._TREE_KERNEL_ENABLED
+    try:
+        verify_module._TREE_KERNEL_ENABLED = False
+        fallback_out, fallback_states, fallback_conv_states = _linear_forward_tree_aware(
+            linear,
+            inputs,
+            ArraysCache(size=2),
+            parents=parents,
+            depth_groups=depth_groups,
+        )
+
+        verify_module._TREE_KERNEL_ENABLED = True
+        kernel_out, kernel_states, kernel_conv_states = _linear_forward_tree_aware(
+            linear,
+            inputs,
+            ArraysCache(size=2),
+            parents=parents,
+            depth_groups=depth_groups,
+        )
+    finally:
+        verify_module._TREE_KERNEL_ENABLED = old_kernel_flag
+
+    mx.eval(
+        fallback_out,
+        fallback_states,
+        fallback_conv_states,
+        kernel_out,
+        kernel_states,
+        kernel_conv_states,
+    )
+    assert np.max(np.abs(np.array(fallback_out - kernel_out))) < 1e-4
+    assert np.max(np.abs(np.array(fallback_states - kernel_states))) < 1e-4
+    assert np.max(np.abs(np.array(fallback_conv_states - kernel_conv_states))) < 1e-4
+
+
+class _FakeKVCache:
+    def __init__(self):
+        self.keys = mx.arange(6, dtype=mx.float32).reshape(1, 1, 6, 1)
+        self.values = (mx.arange(6, dtype=mx.float32) + 10).reshape(1, 1, 6, 1)
+        self.offset = 6
+
+
+class _FakeLinearCache:
+    def __init__(self):
+        self.state = [None, None]
+
+
+def test_tree_aware_path_commit_packs_arbitrary_path():
+    linear_cache = _FakeLinearCache()
+    kv_cache = _FakeKVCache()
+    prefix_len = 2
+    accepted = [0, 3, 1]
+    original_keys = np.array(kv_cache.keys)
+    original_values = np.array(kv_cache.values)
+    tree_cache_state = {
+        "linear_layers": {
+            0: {
+                "conv_states": mx.arange(4, dtype=mx.float32).reshape(4, 1, 1),
+                "states": mx.arange(4, dtype=mx.float32).reshape(4, 1, 1, 1),
+            }
+        }
+    }
+
+    tree_aware_path_commit(
+        [linear_cache, kv_cache],
+        prefix_len=prefix_len,
+        accepted_indices=accepted,
+        tree_cache_state=tree_cache_state,
+    )
+    mx.eval(kv_cache.keys, kv_cache.values, *linear_cache.state)
+
+    source_positions = [prefix_len + idx for idx in accepted]
+    assert kv_cache.offset == prefix_len + len(accepted)
+    assert np.array_equal(
+        np.array(kv_cache.keys)[0, 0, prefix_len : kv_cache.offset, 0],
+        original_keys[0, 0, source_positions, 0],
+    )
+    assert np.array_equal(
+        np.array(kv_cache.values)[0, 0, prefix_len : kv_cache.offset, 0],
+        original_values[0, 0, source_positions, 0],
+    )
+    assert np.array_equal(np.array(linear_cache.state[0]), np.array([[[1.0]]]))
+    assert np.array_equal(np.array(linear_cache.state[1]), np.array([[[[1.0]]]]))
+
+
+def test_tree_aware_verify_matches_sequential_path_logits():
+    args = TextModelArgs(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+        linear_num_value_heads=2,
+        linear_num_key_heads=1,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=2,
+        full_attention_interval=4,
+    )
+    model = TextModel(args)
+    root_token = 1
+    draft_logits = np.full((1, args.vocab_size), -10.0, dtype=np.float32)
+    draft_logits[0, 2] = 10.0
+    draft_logits[0, 3] = 9.0
+    tree = build_ddtree_tree(draft_logits, budget=2)
+    compiled = compile_tree(tree, root_token_id=root_token, prefix_len=0)
+
+    tree_cache = make_target_cache(model, enable_speculative_linear_cache=False)
+    tree_logits, _ = tree_verify_forward(
+        model,
+        compiled_tree=compiled,
+        cache=tree_cache,
+        capture_layer_ids=set(),
+        tree_aware_linear=True,
+        tree_cache_state={},
+    )
+
+    path_token = int(tree.node_token_ids[0])
+    sequential_cache = make_target_cache(model, enable_speculative_linear_cache=False)
+    sequential_logits, _ = target_forward_with_hidden_states(
+        model,
+        input_ids=mx.array([[root_token, path_token]], dtype=mx.uint32),
+        cache=sequential_cache,
+        capture_layer_ids=set(),
+    )
+    mx.eval(tree_logits, sequential_logits)
+
+    tree_path_logits = mx.take(
+        tree_logits,
+        mx.array([0, 1], dtype=mx.int32),
+        axis=1,
+    )
+    assert np.max(np.abs(np.array(tree_path_logits - sequential_logits))) < 1e-3
+
+
 if __name__ == "__main__":
     test_empty_budget()
     test_empty_logits()
@@ -235,4 +462,9 @@ if __name__ == "__main__":
     test_mlx_tree_build_matches_numpy_tree_build()
     test_walk_dfs_exact_prefix_fast_path()
     test_walk_dfs_exact_prefix_divergence()
+    test_tree_aware_gated_delta_matches_chain_forward()
+    test_tree_aware_gated_delta_forks_branch_state()
+    test_tree_aware_gated_delta_kernel_matches_fallback()
+    test_tree_aware_path_commit_packs_arbitrary_path()
+    test_tree_aware_verify_matches_sequential_path_logits()
     print("All tree tests passed!")
