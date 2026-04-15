@@ -130,6 +130,10 @@ def generate_ddtree_once(
         build_suppress_token_mask,
         _eval_logits_and_captured,
         _arm_target_rollback_with_prefix,
+        _match_acceptance_length,
+        _resolve_verify_len_cap,
+        _restore_target_cache_after_acceptance,
+        _verify_target_block,
     )
     from dflash_mlx.model import ContextOnlyDraftKVCache
 
@@ -181,15 +185,30 @@ def generate_ddtree_once(
     acceptance_history: list[int] = []
     fast_path_count = 0
     slow_path_count = 0
+    ddtree_cycles_completed = 0
+    dflash_cycles_completed = 0
+    dflash_accepted_from_draft = 0
 
     # Timing accumulators
     draft_ns = 0
+    dflash_draft_ns = 0
+    dflash_verify_ns = 0
+    dflash_replay_ns = 0
+    dflash_commit_ns = 0
     tree_build_ns = 0
     tree_verify_ns = 0
     commit_ns = 0
     verify_linear_ns = 0
     verify_attention_ns = 0
-    profile_verify = os.environ.get("DDTREE_PROFILE_VERIFY", "").lower() not in (
+    verify_detail_ns: dict[str, int] = {}
+    profile_verify_value = os.environ.get("DDTREE_PROFILE_VERIFY", "").lower()
+    profile_verify = profile_verify_value not in (
+        "",
+        "0",
+        "false",
+    )
+    profile_detail_value = os.environ.get("DDTREE_PROFILE_DETAIL", "").lower()
+    profile_detail = profile_verify_value in ("detail", "full", "2") or profile_detail_value not in (
         "",
         "0",
         "false",
@@ -200,10 +219,156 @@ def generate_ddtree_once(
         "false",
     )
     tree_aware_commit_count = 0
+    controller_enabled = os.environ.get("DDTREE_DFLASH_CONTROLLER", "").lower() not in (
+        "",
+        "0",
+        "false",
+    )
+    controller_warmup = int(os.environ.get("DDTREE_CONTROLLER_WARMUP", "16"))
+    controller_interval = max(1, int(os.environ.get("DDTREE_CONTROLLER_INTERVAL", "8")))
+    controller_margin = float(os.environ.get("DDTREE_CONTROLLER_MARGIN", "1.20"))
+    controller_min_probes = max(1, int(os.environ.get("DDTREE_CONTROLLER_MIN_PROBES", "3")))
+    controller_mode = "ddtree"
+    controller_switch_count = 0
+    controller_probe_count = 0
+    controller_last_probe_cycle = -1
+    ddtree_cycle_tps: list[float] = []
+    dflash_cycle_tps: list[float] = []
+    verify_len_cap = _resolve_verify_len_cap(target_model, block_size)
+
+    def _run_dflash_cycle(block_len: int) -> tuple[int, bool, float]:
+        nonlocal target_hidden, staged_first, start
+        nonlocal dflash_draft_ns, dflash_verify_ns, dflash_replay_ns, dflash_commit_ns
+        nonlocal dflash_cycles_completed, dflash_accepted_from_draft, cycles_completed
+
+        cycle_start_ns = time.perf_counter_ns()
+        block_token_ids = mx.full(
+            (block_len,), draft_model.mask_token_id, dtype=mx.uint32
+        )
+        block_token_ids[0] = staged_first[0] if staged_first.ndim > 0 else staged_first
+
+        if block_len > 1:
+            draft_start_ns = time.perf_counter_ns()
+            noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
+            draft_hidden = draft_model(
+                noise_embedding=noise_embedding,
+                target_hidden=target_hidden,
+                cache=draft_cache,
+            )
+            draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
+            mx.async_eval(draft_logits)
+            mx.eval(draft_logits)
+            drafted = greedy_tokens_with_mask(draft_logits, suppress_mask).squeeze(0)
+            block_token_ids[1:block_len] = drafted
+            dflash_draft_ns += time.perf_counter_ns() - draft_start_ns
+
+        verify_token_ids = block_token_ids[: min(block_len, verify_len_cap)]
+        _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
+
+        verify_start_ns = time.perf_counter_ns()
+        verify_logits, verify_hidden_raw = _verify_target_block(
+            target_model=target_model,
+            verify_ids=verify_token_ids[None],
+            target_cache=target_cache,
+            verify_chunk_tokens=None,
+            capture_layer_ids=capture_layer_ids,
+        )
+        dflash_verify_ns += time.perf_counter_ns() - verify_start_ns
+
+        posterior = greedy_tokens_with_mask(verify_logits[0], suppress_mask)
+        acceptance_len = int(
+            _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
+        )
+        commit_count = 1 + acceptance_len
+        committed_segment = verify_token_ids[:commit_count]
+        committed_hidden = extract_context_feature_from_dict(
+            verify_hidden_raw,
+            list(draft_model.target_layer_ids),
+        )[:, :commit_count, :]
+        mx.eval(committed_hidden, posterior)
+
+        committed_ids = committed_segment.tolist()
+        emitted_ids = committed_ids
+        stop_hit = False
+        if stop_token_array is not None:
+            for pos, token_id in enumerate(committed_ids):
+                if token_id in stop_token_ids:
+                    emitted_ids = committed_ids[: pos + 1]
+                    stop_hit = True
+                    break
+        generated_tokens.extend(emitted_ids)
+
+        commit_start_ns = time.perf_counter_ns()
+        start += commit_count
+        target_hidden = committed_hidden
+        replay_ns = _restore_target_cache_after_acceptance(
+            target_cache,
+            target_len=start,
+            acceptance_length=acceptance_len,
+            drafted_tokens=block_len - 1,
+        )
+        dflash_replay_ns += replay_ns
+        dflash_commit_ns += time.perf_counter_ns() - commit_start_ns
+
+        staged_first = posterior[acceptance_len : acceptance_len + 1]
+        acceptance_history.append(commit_count)
+        dflash_accepted_from_draft += acceptance_len
+        dflash_cycles_completed += 1
+        cycles_completed += 1
+
+        cycle_ns = time.perf_counter_ns() - cycle_start_ns
+        cycle_tps = commit_count / (cycle_ns / 1e9) if cycle_ns > 0 else 0.0
+        return commit_count, stop_hit, cycle_tps
 
     while len(generated_tokens) < max_new_tokens:
         remaining = max_new_tokens - len(generated_tokens)
         block_len = max(1, min(block_size, remaining))
+        cycle_start_ns = time.perf_counter_ns()
+
+        controller_probe = (
+            controller_enabled
+            and controller_mode == "ddtree"
+            and ddtree_cycles_completed >= controller_warmup
+            and ddtree_cycles_completed != controller_last_probe_cycle
+            and (ddtree_cycles_completed - controller_warmup) % controller_interval == 0
+        )
+        if controller_mode == "dflash" or controller_probe:
+            _, stop_hit, cycle_tps = _run_dflash_cycle(block_len)
+            dflash_cycle_tps.append(cycle_tps)
+            if controller_probe:
+                controller_last_probe_cycle = ddtree_cycles_completed
+                controller_probe_count += 1
+                recent = ddtree_cycle_tps[-controller_interval:]
+                recent_ddtree_tps = (
+                    sum(recent) / len(recent) if recent else 0.0
+                )
+                recent_dflash = dflash_cycle_tps[-controller_min_probes:]
+                recent_dflash_tps = (
+                    sum(recent_dflash) / len(recent_dflash)
+                    if len(recent_dflash) >= controller_min_probes
+                    else 0.0
+                )
+                all_dflash_probe_tps = (
+                    sum(dflash_cycle_tps) / len(dflash_cycle_tps)
+                    if len(dflash_cycle_tps) >= controller_min_probes
+                    else 0.0
+                )
+                all_ddtree_tps = (
+                    sum(ddtree_cycle_tps) / len(ddtree_cycle_tps)
+                    if ddtree_cycle_tps
+                    else 0.0
+                )
+                if (
+                    recent_ddtree_tps > 0
+                    and all_ddtree_tps > 0
+                    and recent_dflash_tps > recent_ddtree_tps * controller_margin
+                    and all_dflash_probe_tps > all_ddtree_tps * controller_margin
+                ):
+                    controller_mode = "dflash"
+                    controller_switch_count += 1
+            if stop_hit:
+                break
+            continue
 
         # --- DRAFT ---
         draft_start = time.perf_counter_ns()
@@ -266,7 +431,7 @@ def generate_ddtree_once(
 
         # --- TREE VERIFY ---
         verify_start = time.perf_counter_ns()
-        verify_profile = {} if profile_verify else None
+        verify_profile = {"_detail": profile_detail} if profile_verify else None
         tree_cache_state: dict[str, Any] | None = {} if tree_aware_linear else None
         verify_logits, verify_hidden = tree_verify_forward(
             target_model,
@@ -282,6 +447,11 @@ def generate_ddtree_once(
         if verify_profile is not None:
             verify_linear_ns += verify_profile.get("linear_ns", 0)
             verify_attention_ns += verify_profile.get("attention_ns", 0)
+            for key, value in verify_profile.items():
+                if key.startswith("_") or key in ("linear_ns", "attention_ns"):
+                    continue
+                if isinstance(value, int):
+                    verify_detail_ns[key] = verify_detail_ns.get(key, 0) + value
 
         # --- TREE WALK ---
         posterior = greedy_tokens_with_mask(verify_logits[0], suppress_mask)
@@ -417,6 +587,10 @@ def generate_ddtree_once(
         target_hidden = committed_hidden
         staged_first = mx.array([bonus_token], dtype=mx.uint32)
         cycles_completed += 1
+        ddtree_cycles_completed += 1
+        cycle_ns = time.perf_counter_ns() - cycle_start_ns
+        if cycle_ns > 0:
+            ddtree_cycle_tps.append(n_accepted / (cycle_ns / 1e9))
 
         if stop_hit:
             break
@@ -434,6 +608,10 @@ def generate_ddtree_once(
     phase_timings = {
         "prefill": prefill_ns / 1_000.0,
         "draft": draft_ns / 1_000.0,
+        "dflash_draft": dflash_draft_ns / 1_000.0,
+        "dflash_verify": dflash_verify_ns / 1_000.0,
+        "dflash_replay": dflash_replay_ns / 1_000.0,
+        "dflash_commit": dflash_commit_ns / 1_000.0,
         "tree_build": tree_build_ns / 1_000.0,
         "tree_verify": tree_verify_ns / 1_000.0,
         "commit": commit_ns / 1_000.0,
@@ -441,6 +619,10 @@ def generate_ddtree_once(
     if profile_verify:
         phase_timings["tree_verify_linear"] = verify_linear_ns / 1_000.0
         phase_timings["tree_verify_attention"] = verify_attention_ns / 1_000.0
+    if verify_detail_ns:
+        phase_timings["tree_verify_detail"] = {
+            key: value / 1_000.0 for key, value in sorted(verify_detail_ns.items())
+        }
 
     return {
         "generated_token_ids": generated_tokens,
@@ -449,6 +631,9 @@ def generate_ddtree_once(
         "prefill_us": prefill_ns / 1_000.0,
         "tokens_per_second": gen_count / (elapsed_us / 1e6) if elapsed_us > 0 else 0,
         "cycles_completed": cycles_completed,
+        "ddtree_cycles_completed": ddtree_cycles_completed,
+        "dflash_cycles_completed": dflash_cycles_completed,
+        "dflash_accepted_from_draft": dflash_accepted_from_draft,
         "acceptance_history": acceptance_history,
         "avg_acceptance": (
             sum(acceptance_history) / len(acceptance_history)
@@ -459,6 +644,17 @@ def generate_ddtree_once(
         "slow_path_count": slow_path_count,
         "tree_aware_commit_count": tree_aware_commit_count,
         "tree_aware_linear": tree_aware_linear,
+        "dflash_controller_enabled": controller_enabled,
+        "dflash_controller_mode": controller_mode,
+        "dflash_controller_probe_count": controller_probe_count,
+        "dflash_controller_switch_count": controller_switch_count,
+        "dflash_controller_min_probes": controller_min_probes,
+        "ddtree_cycle_tps_avg": (
+            sum(ddtree_cycle_tps) / len(ddtree_cycle_tps) if ddtree_cycle_tps else 0.0
+        ),
+        "dflash_cycle_tps_avg": (
+            sum(dflash_cycle_tps) / len(dflash_cycle_tps) if dflash_cycle_tps else 0.0
+        ),
         "fast_path_ratio": (
             fast_path_count / (fast_path_count + slow_path_count)
             if (fast_path_count + slow_path_count) > 0

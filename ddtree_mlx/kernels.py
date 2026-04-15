@@ -87,6 +87,112 @@ def _make_tree_gated_delta_kernel():
 _tree_gated_delta_kernel = _make_tree_gated_delta_kernel()
 
 
+def _make_tree_conv1d_kernel():
+    if not mx.metal.is_available():
+        return None
+
+    source = """
+        auto c_idx = thread_position_in_grid.x;
+        auto b_idx = thread_position_in_grid.y;
+
+        if (c_idx >= ConvDim) {
+          return;
+        }
+
+        for (int t = 0; t < T; ++t) {
+          auto parent_idx = parents[t];
+
+          float acc = 0.0f;
+          for (int k = 0; k < Keep; ++k) {
+            float x;
+            if (parent_idx < 0) {
+              x = static_cast<float>(
+                base_conv_state[(b_idx * Keep + k) * ConvDim + c_idx]
+              );
+            } else {
+              x = static_cast<float>(
+                conv_states[
+                  (((b_idx * T + parent_idx) * Keep + k) * ConvDim) + c_idx
+                ]
+              );
+            }
+            auto w = static_cast<float>(conv_weight[k * ConvDim + c_idx]);
+            acc += x * w;
+          }
+
+          auto qkv_t = qkv + (b_idx * T + t) * ConvDim;
+          acc += static_cast<float>(qkv_t[c_idx])
+            * static_cast<float>(conv_weight[Keep * ConvDim + c_idx]);
+
+          auto silu = acc / (1.0f + exp(-acc));
+          conv_out[(b_idx * T + t) * ConvDim + c_idx] =
+            static_cast<InT>(silu);
+
+          for (int k = 0; k < Keep; ++k) {
+            InT value;
+            if (k + 1 < Keep) {
+              if (parent_idx < 0) {
+                value = base_conv_state[(b_idx * Keep + k + 1) * ConvDim + c_idx];
+              } else {
+                value = conv_states[
+                  (((b_idx * T + parent_idx) * Keep + k + 1) * ConvDim) + c_idx
+                ];
+              }
+            } else {
+              value = qkv_t[c_idx];
+            }
+            conv_states[
+              (((b_idx * T + t) * Keep + k) * ConvDim) + c_idx
+            ] = value;
+          }
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="ddtree_tree_conv1d",
+        input_names=["qkv", "base_conv_state", "conv_weight", "parents", "T"],
+        output_names=["conv_out", "conv_states"],
+        source=source,
+    )
+
+
+_tree_conv1d_kernel = _make_tree_conv1d_kernel()
+
+
+def tree_conv1d_kernel(
+    qkv: mx.array,
+    base_conv_state: mx.array,
+    conv_weight: mx.array,
+    parents: mx.array,
+) -> Optional[tuple[mx.array, mx.array]]:
+    """Run parent-aware depthwise causal conv over a tree in one Metal launch."""
+    if _tree_conv1d_kernel is None:
+        return None
+    if int(base_conv_state.shape[1]) <= 0:
+        return None
+
+    B, T, conv_dim = qkv.shape
+    keep = int(base_conv_state.shape[1])
+    if int(conv_weight.shape[0]) != keep + 1:
+        return None
+    if int(conv_weight.shape[1]) != conv_dim:
+        return None
+
+    input_type = qkv.dtype
+    return _tree_conv1d_kernel(
+        inputs=[qkv, base_conv_state, conv_weight, parents, T],
+        template=[
+            ("InT", input_type),
+            ("Keep", keep),
+            ("ConvDim", conv_dim),
+        ],
+        grid=(conv_dim, B, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(B, T, conv_dim), (B, T, keep, conv_dim)],
+        output_dtypes=[input_type, input_type],
+    )
+
+
 def tree_gated_delta_kernel(
     q: mx.array,
     k: mx.array,

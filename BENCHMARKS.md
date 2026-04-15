@@ -96,6 +96,11 @@ DDTree-4, prompt 1 (1117 tokens generated):
    - 86% fast-path rate, 3.2 tokens accepted per cycle
    - Higher budgets (8, 16, 32) increase verify cost faster than acceptance gains
 
+4. **Parent-aware conv Metal kernel** (verify-fusion-controller branch)
+   - Replaces the Python depth-group conv loop before the GatedDelta recurrence kernel
+   - Short TCP/UDP probe, 128 generated tokens: DDTree-4 improved from 31.8 tok/s to 35.0 tok/s
+   - Tree verify time dropped from 3,193ms to 2,833ms on that probe
+
 ### What Didn't Work
 
 | Approach | Result | Why |
@@ -105,8 +110,10 @@ DDTree-4, prompt 1 (1117 tokens generated):
 | **Chain tree shape** | 1.14x (worse than heap) | Linear chain has 100% fast path but lower acceptance diversity. |
 | **Hybrid tree shape** | 0.98x (break-even) | Half chain + half root alternatives underperforms the heap algorithm. |
 | **Root-wide tree shape** | 0.75x (worse) | All siblings at depth 1 gives only 2.0 acceptance — not enough depth. |
-| **Split prefix/tree attention** | 1.24x (neutral) | Manual matmul + LSE combination is slower than MLX's optimized SDPA at 2K context. May help at 8K+. |
+| **Split prefix/tree attention at 2K** | 1.24x (neutral) | Manual matmul + LSE combination is slower than MLX's optimized SDPA at 2K context. |
+| **Exact prefix/tree attention synthetic 8K/16K** | 3-4x slower than SDPA | Correct within bf16 tolerance, but manual matmul/LSE loses to MLX SDPA for Qwen-like small-query shapes. Kept as opt-in only. |
 | **Adaptive budget controller** | 1.25x (neutral) | Adds complexity, no measurable gain when eval reduction is already applied. |
+| **Aggressive DFlash controller** | Worse on short prompts | A single lucky DFlash probe can switch too early. The implemented controller is opt-in and now requires sustained probe wins. |
 | **Breadth bias (depth_penalty)** | ~1.24x (neutral) | Tree is too small at budget=4 for depth redistribution to matter. |
 | **DFS-order mode** | 1.04x (worse than tree-aware) | DFS contamination of non-prefix paths reduces acceptance. |
 
@@ -133,7 +140,13 @@ The fundamental limitation is Qwen 3.5 27B's hybrid architecture:
 | `DDTREE_BUDGET` | `4` | Tree node budget (excluding root) |
 | `DDTREE_TREE_AWARE_LINEAR` | `1` | Use parent-state forking for GatedDeltaNet |
 | `DDTREE_TREE_KERNEL` | `1` | Use Metal kernel for tree-aware recurrence |
-| `DDTREE_PROFILE_VERIFY` | `0` | Profile linear vs attention layer timing |
+| `DDTREE_TREE_CONV_KERNEL` | `1` | Use Metal kernel for parent-aware causal conv |
+| `DDTREE_EXACT_TREE_ATTENTION` | `0` | Opt-in exact prefix/tree attention; set to `auto` for long-context testing |
+| `DDTREE_EXACT_TREE_ATTENTION_MIN_PREFIX` | `8192` | Prefix length for exact split attention in auto mode |
+| `DDTREE_DFLASH_CONTROLLER` | `0` | Opt-in in-place DDTree/DFlash cycle controller |
+| `DDTREE_CONTROLLER_MARGIN` | `1.20` | Required DFlash probe advantage before switching |
+| `DDTREE_PROFILE_VERIFY` | `0` | Profile linear vs attention layer timing; use `detail` for per-op timings |
+| `DDTREE_PROFILE_DETAIL` | `0` | Enable detailed synchronized verify timings |
 
 ## Files
 

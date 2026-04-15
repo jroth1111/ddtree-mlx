@@ -124,7 +124,12 @@ python benchmark.py --max-tokens 2048 --budgets 4 --prompts 3
 | `DDTREE_BUDGET` | `4` | Tree node budget (excluding root). Budget 4 is optimal for hybrid models. |
 | `DDTREE_TREE_AWARE_LINEAR` | `1` | Enable parent-state forking for recurrent layers (recommended). |
 | `DDTREE_TREE_KERNEL` | `1` | Use custom Metal kernel for tree-aware GatedDelta recurrence. |
-| `DDTREE_PROFILE_VERIFY` | `0` | Profile linear vs attention layer timing within tree verify. |
+| `DDTREE_TREE_CONV_KERNEL` | `1` | Use Metal kernel for parent-aware causal conv inside GatedDelta verification. |
+| `DDTREE_EXACT_TREE_ATTENTION` | `0` | Opt-in exact prefix/tree attention without a prefix-width mask. Set to `auto` for long-context testing. |
+| `DDTREE_EXACT_TREE_ATTENTION_MIN_PREFIX` | `8192` | Prefix length where exact split attention turns on in `auto` mode. |
+| `DDTREE_DFLASH_CONTROLLER` | `0` | Opt-in in-place controller that can switch future cycles to DFlash after sustained probe wins. |
+| `DDTREE_PROFILE_VERIFY` | `0` | Profile linear vs attention layer timing within tree verify. Use `detail` for per-operation timings. |
+| `DDTREE_PROFILE_DETAIL` | `0` | Enable detailed synchronized verify timings when `DDTREE_PROFILE_VERIFY` is set. |
 
 ## Architecture
 
@@ -133,7 +138,7 @@ ddtree_mlx/
   tree.py       # Heap-based tree construction (Algorithm 1 from the paper)
   compile.py    # Converts tree structure to MLX tensors (masks, positions, DFS order)
   verify.py     # Custom forward pass: tree attention + parent-indexed recurrence
-  kernels.py    # Metal kernel for tree-aware GatedDelta state update
+  kernels.py    # Metal kernels for tree-aware conv and GatedDelta state update
   cache.py      # Cache management: snapshot, rollback, tree-aware path commit
   runtime.py    # Main generate loop: draft -> build -> verify -> walk -> commit
 ddtree_server.py  # OpenAI-compatible FastAPI server
@@ -165,7 +170,7 @@ If no DFlash drafter is available for a model, DDTree cannot be used. This is th
 
 See [BENCHMARKS.md](BENCHMARKS.md) for detailed results, including:
 
-- **What worked**: Metal kernel for tree-aware recurrence, zero-cost commit via per-node state capture, eval sync point reduction
+- **What worked**: Metal kernels for tree-aware conv/recurrent verification, zero-cost commit via per-node state capture, eval sync point reduction
 - **What didn't work**: Attention-only tree verify (LM head needs all 64 layers), alternative tree shapes (chain, hybrid, root-wide), split prefix/tree attention, adaptive budget controller
 - **The fundamental constraint**: On hybrid models (75% recurrent layers), tree verification has limited parallelism. DDTree's advantage comes from better acceptance density -- the tree concentrates budget on the most probable tokens. Pure-attention models (Llama, standard Qwen) would benefit more.
 
