@@ -33,7 +33,8 @@ On moderate-acceptance prompts (where the draft model doesn't predict perfectly)
 | Method | Avg tok/s | vs DFlash | Notes |
 |--------|----------:|----------:|-------|
 | DFlash (baseline) | 25.1 | 1.00x | Block diffusion speculative decoding |
-| **DDTree-4** | **31.1** | **1.24x** | Tree-based speculative decoding |
+| DDTree-4 (pre-conv-kernel) | 31.1 | 1.24x | Tree-aware commit + eval reduction |
+| **DDTree-4 (with conv kernel)** | **~35** | **~1.39x** | + parent-aware conv Metal kernel (short probe) |
 
 ### Per-Prompt Breakdown
 

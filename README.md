@@ -18,7 +18,7 @@ Qwen 3.5 27B 4-bit on Mac Studio M3 Ultra 256GB:
 | 8K tokens | 36.7 tok/s | 72.7 tok/s | ~95 tok/s | **2.6x** |
 | 16K tokens | 36.2 tok/s | 74.0 tok/s | ~73 tok/s | **2.0x** |
 
-DDTree is **1.24x faster than DFlash on average**, reaching **1.5-1.6x on prompts where the draft model has moderate acceptance** (68-70%). Output is lossless -- every token is verified against the target model.
+DDTree is **1.24-1.39x faster than DFlash** (with the parent-aware conv Metal kernel reaching ~35 tok/s in probes), and up to **1.5-1.6x on prompts where the draft model has moderate acceptance** (68-70%). Output is lossless -- every token is verified against the target model.
 
 ## How It Works
 
