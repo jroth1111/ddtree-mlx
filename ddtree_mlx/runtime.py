@@ -219,7 +219,7 @@ def generate_ddtree_once(
         "false",
     )
     tree_aware_commit_count = 0
-    exact_commit = os.environ.get("DDTREE_EXACT_COMMIT", "1").lower() not in (
+    exact_commit = os.environ.get("DDTREE_EXACT_COMMIT", "0").lower() not in (
         "",
         "0",
         "false",

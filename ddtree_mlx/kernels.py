@@ -71,6 +71,11 @@ def _make_tree_gated_delta_kernel():
             + (((b_idx * T + t) * Hv + hv_idx) * Dv + dv_idx) * Dk;
           for (int i = 0; i < n_per_t; ++i) {
             auto s_idx = n_per_t * dk_idx + i;
+            // Roundtrip through InT to match the sequential kernel's
+            // per-token precision loss (float32 → bfloat16 → float32).
+            // Without this, tree state accumulates at higher precision
+            // than sequential, causing output divergence over cycles.
+            state[i] = static_cast<float>(static_cast<InT>(state[i]));
             state_t[s_idx] = static_cast<StT>(state[i]);
           }
         }
