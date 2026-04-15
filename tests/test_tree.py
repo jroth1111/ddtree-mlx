@@ -11,9 +11,11 @@ from ddtree_mlx.compile import compile_tree
 from ddtree_mlx.runtime import _build_tree_from_mlx_logits, _walk_dfs_exact_prefix
 from ddtree_mlx.verify import (
     _linear_forward_tree_aware,
+    _split_prefix_tree_attention_exact,
     _tree_depth_groups,
     tree_verify_forward,
 )
+from ddtree_mlx.kernels import tree_conv1d_kernel
 from ddtree_mlx.tree import build_ddtree_tree, follow_verified_tree, compute_dfs_order
 
 
@@ -347,6 +349,84 @@ def test_tree_aware_gated_delta_kernel_matches_fallback():
     assert np.max(np.abs(np.array(fallback_conv_states - kernel_conv_states))) < 1e-4
 
 
+def test_tree_conv1d_kernel_matches_python_reference():
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return
+
+    rng = np.random.default_rng(123)
+    qkv_np = rng.normal(size=(1, 6, 11)).astype(np.float32)
+    base_np = rng.normal(size=(1, 3, 11)).astype(np.float32)
+    weight_np = rng.normal(size=(4, 11)).astype(np.float32)
+    parents = [-1, 0, 0, 1, 2, 3]
+
+    conv_out, conv_states = tree_conv1d_kernel(
+        mx.array(qkv_np),
+        mx.array(base_np),
+        mx.array(weight_np),
+        mx.array(parents, dtype=mx.int32),
+    )
+    mx.eval(conv_out, conv_states)
+
+    expected_out = np.empty_like(qkv_np)
+    expected_states = np.empty((1, 6, 3, 11), dtype=np.float32)
+    for t, parent in enumerate(parents):
+        parent_state = base_np[0] if parent < 0 else expected_states[0, parent]
+        conv_input = np.concatenate([parent_state, qkv_np[0, t : t + 1]], axis=0)
+        raw = (conv_input * weight_np).sum(axis=0)
+        expected_out[0, t] = raw / (1.0 + np.exp(-raw))
+        expected_states[0, t] = conv_input[-3:]
+
+    assert np.max(np.abs(np.array(conv_out) - expected_out)) < 1e-5
+    assert np.max(np.abs(np.array(conv_states) - expected_states)) < 1e-5
+
+
+def test_exact_prefix_tree_attention_matches_masked_sdpa():
+    prefix_len = 5
+    tree_len = 3
+    heads = 2
+    head_dim = 4
+
+    queries = mx.random.normal((1, heads, tree_len, head_dim))
+    keys = mx.random.normal((1, 1, prefix_len + tree_len, head_dim))
+    values = mx.random.normal((1, 1, prefix_len + tree_len, head_dim))
+    tree_visible = np.array(
+        [
+            [True, False, False],
+            [True, True, False],
+            [True, False, True],
+        ],
+        dtype=np.bool_,
+    )
+    tree_mask = mx.array(np.where(tree_visible, 0.0, -np.inf).astype(np.float32))[
+        None,
+        None,
+        :,
+        :,
+    ]
+    prefix_mask = mx.zeros((1, 1, tree_len, prefix_len), dtype=mx.float32)
+    full_mask = mx.concatenate([prefix_mask, tree_mask], axis=-1)
+    repeated_keys = mx.repeat(keys, heads, axis=1)
+    repeated_values = mx.repeat(values, heads, axis=1)
+
+    baseline = mx.fast.scaled_dot_product_attention(
+        queries,
+        repeated_keys,
+        repeated_values,
+        scale=head_dim ** -0.5,
+        mask=full_mask,
+    )
+    exact = _split_prefix_tree_attention_exact(
+        queries=queries,
+        keys=keys,
+        values=values,
+        scale=head_dim ** -0.5,
+        tree_mask=tree_mask,
+        cached_prefix_len=prefix_len,
+    )
+    mx.eval(baseline, exact)
+    assert np.max(np.abs(np.array(baseline - exact))) < 1e-4
+
+
 class _FakeKVCache:
     def __init__(self):
         self.keys = mx.arange(6, dtype=mx.float32).reshape(1, 1, 6, 1)
@@ -465,6 +545,8 @@ if __name__ == "__main__":
     test_tree_aware_gated_delta_matches_chain_forward()
     test_tree_aware_gated_delta_forks_branch_state()
     test_tree_aware_gated_delta_kernel_matches_fallback()
+    test_tree_conv1d_kernel_matches_python_reference()
+    test_exact_prefix_tree_attention_matches_masked_sdpa()
     test_tree_aware_path_commit_packs_arbitrary_path()
     test_tree_aware_verify_matches_sequential_path_logits()
     print("All tree tests passed!")

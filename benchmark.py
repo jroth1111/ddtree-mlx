@@ -2,7 +2,7 @@
 Benchmark DDTree-MLX vs DFlash baseline.
 
 Usage:
-    python3.12 benchmark.py [--max-tokens 4096] [--budgets 8,16,24]
+    python3.12 benchmark.py [--max-tokens 4096] [--budgets 4]
 """
 
 import argparse
@@ -63,7 +63,7 @@ def main():
     parser.add_argument("--model", default="mlx-community/Qwen3.5-27B-4bit")
     parser.add_argument("--draft", default=None)
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--budgets", default="8,16,24")
+    parser.add_argument("--budgets", default="4")
     parser.add_argument("--prompts", type=int, default=3, help="Number of prompts to test")
     parser.add_argument("--output", default=None, help="JSON output file")
     args = parser.parse_args()
@@ -149,6 +149,33 @@ def main():
                     "tree_aware_linear": ddtree_result.get("tree_aware_linear", False),
                     "tree_aware_commit_count": ddtree_result.get(
                         "tree_aware_commit_count", 0
+                    ),
+                    "ddtree_cycles_completed": ddtree_result.get(
+                        "ddtree_cycles_completed", 0
+                    ),
+                    "dflash_cycles_completed": ddtree_result.get(
+                        "dflash_cycles_completed", 0
+                    ),
+                    "dflash_controller_enabled": ddtree_result.get(
+                        "dflash_controller_enabled", False
+                    ),
+                    "dflash_controller_mode": ddtree_result.get(
+                        "dflash_controller_mode", "ddtree"
+                    ),
+                    "dflash_controller_probe_count": ddtree_result.get(
+                        "dflash_controller_probe_count", 0
+                    ),
+                    "dflash_controller_switch_count": ddtree_result.get(
+                        "dflash_controller_switch_count", 0
+                    ),
+                    "dflash_controller_min_probes": ddtree_result.get(
+                        "dflash_controller_min_probes", 0
+                    ),
+                    "ddtree_cycle_tps_avg": ddtree_result.get(
+                        "ddtree_cycle_tps_avg", 0
+                    ),
+                    "dflash_cycle_tps_avg": ddtree_result.get(
+                        "dflash_cycle_tps_avg", 0
                     ),
                     "phase_timings_us": ddtree_result.get("phase_timings_us", {}),
                 })
