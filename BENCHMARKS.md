@@ -5,11 +5,30 @@
 - **Hardware**: Mac Studio M3 Ultra 256GB
 - **Target model**: `mlx-community/Qwen3.5-27B-4bit` (hybrid: 48 GatedDeltaNet + 16 full attention)
 - **Draft model**: `z-lab/Qwen3.5-27B-DFlash` (block diffusion drafter)
-- **Baseline**: DFlash speculative decoding (~25 tok/s on this hardware)
 - **DDTree budget**: 4 (optimal for this model)
 - **Max tokens**: 2048 unless noted
 
-## Final Performance
+## The Full Acceleration Stack: AR → DFlash → DDTree
+
+| Output Length | Autoregressive | DFlash | DDTree | DFlash vs AR | DDTree vs AR |
+|--------------:|---------------:|-------:|-------:|-------------:|-------------:|
+| 1K tokens | 37.8 tok/s | 53.2 tok/s | ~73 tok/s | 1.41x | **~1.9x** |
+| 2K tokens | 37.8 tok/s | 58.0 tok/s | ~72 tok/s | 1.53x | **~1.9x** |
+| 4K tokens | 37.4 tok/s | 67.1 tok/s | ~90 tok/s | 1.79x | **~2.4x** |
+| 8K tokens | 36.7 tok/s | 72.7 tok/s | ~95 tok/s | 1.98x | **~2.6x** |
+| 16K tokens | 36.2 tok/s | 74.0 tok/s | ~73 tok/s | 2.04x | **~2.0x** |
+
+AR and DFlash columns are measured directly (Round 11 benchmarks, IPv4 code prompt, `--no-eos`).
+DDTree column is estimated by applying DDTree's measured speedup over DFlash (1.38x/1.29x/1.34x/1.31x/0.98x
+from the long-context sweep below) to the Round 11 DFlash tok/s. At 16K, DDTree breaks even with DFlash
+due to attention cost growing with prefix length.
+
+**DDTree delivers ~2x over autoregressive through 8K tokens, peaking at ~2.6x at 8K.**
+
+On moderate-acceptance prompts (where the draft model doesn't predict perfectly), DDTree reaches
+**1.5-1.6x over DFlash, translating to ~2.4-3.1x over autoregressive**.
+
+## DDTree vs DFlash (Measured)
 
 | Method | Avg tok/s | vs DFlash | Notes |
 |--------|----------:|----------:|-------|
