@@ -139,6 +139,7 @@ The fundamental limitation is Qwen 3.5 27B's hybrid architecture:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DDTREE_BUDGET` | `4` | Tree node budget (excluding root) |
+| `DDTREE_EXACT_COMMIT` | `1` | Re-forward accepted tokens sequentially for lossless output |
 | `DDTREE_TREE_AWARE_LINEAR` | `1` | Use parent-state forking for GatedDeltaNet |
 | `DDTREE_TREE_KERNEL` | `1` | Use Metal kernel for tree-aware recurrence |
 | `DDTREE_TREE_CONV_KERNEL` | `1` | Use Metal kernel for parent-aware causal conv |

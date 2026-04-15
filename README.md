@@ -122,6 +122,7 @@ python benchmark.py --max-tokens 2048 --budgets 4 --prompts 3
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `DDTREE_BUDGET` | `4` | Tree node budget (excluding root). Budget 4 is optimal for hybrid models. |
+| `DDTREE_EXACT_COMMIT` | `1` | Re-forward accepted tokens sequentially for lossless output. Set to `0` for faster but non-lossless mode. |
 | `DDTREE_TREE_AWARE_LINEAR` | `1` | Enable parent-state forking for recurrent layers (recommended). |
 | `DDTREE_TREE_KERNEL` | `1` | Use custom Metal kernel for tree-aware GatedDelta recurrence. |
 | `DDTREE_TREE_CONV_KERNEL` | `1` | Use Metal kernel for parent-aware causal conv inside GatedDelta verification. |

@@ -219,6 +219,11 @@ def generate_ddtree_once(
         "false",
     )
     tree_aware_commit_count = 0
+    exact_commit = os.environ.get("DDTREE_EXACT_COMMIT", "1").lower() not in (
+        "",
+        "0",
+        "false",
+    )
     controller_enabled = os.environ.get("DDTREE_DFLASH_CONTROLLER", "").lower() not in (
         "",
         "0",
@@ -477,7 +482,47 @@ def generate_ddtree_once(
             else exact_prefix_len == len(accepted_indices)
         )
 
-        if tree_aware_linear:
+        if tree_aware_linear and exact_commit:
+            # EXACT COMMIT: re-forward accepted tokens sequentially to get
+            # correct recurrent state (tree-aware verify accumulates FP
+            # differently than sequential, causing output divergence).
+            # Tree verify is used only for path selection (which tokens
+            # to accept); the commit forward ensures lossless output.
+            tree_aware_commit_count += 1
+            # Restore attention KV caches to prefix (undo tree appends)
+            for c in target_cache:
+                if hasattr(c, "offset") and not hasattr(c, "rollback"):
+                    c.offset = start
+            # Arm rollback for recurrent layers
+            _arm_target_rollback_with_prefix(target_cache, prefix_len=start)
+            # Sequential forward of accepted tokens through all 64 layers
+            accepted_token_ids_commit = _tree_token_ids(
+                tree, root_token, accepted_indices
+            )
+            commit_ids_mx = mx.array(accepted_token_ids_commit, dtype=mx.uint32)[None]
+            commit_logits, commit_hidden_raw = target_forward_with_hidden_states(
+                target_model,
+                input_ids=commit_ids_mx,
+                cache=target_cache,
+                capture_layer_ids=capture_layer_ids,
+            )
+            _eval_logits_and_captured(commit_logits, commit_hidden_raw)
+            committed_hidden = extract_context_feature_from_dict(
+                commit_hidden_raw, list(draft_model.target_layer_ids)
+            )
+            # Use the REAL bonus token from sequential forward, not tree logits
+            bonus_token = int(
+                greedy_tokens_with_mask(
+                    commit_logits[:, -1, :], suppress_mask
+                ).item()
+            )
+            if use_fast_path:
+                fast_path_count += 1
+            else:
+                slow_path_count += 1
+        elif tree_aware_linear:
+            # TREE-AWARE COMMIT (fast but not lossless on hybrid models):
+            # Installs tree-computed recurrent state directly.
             tree_aware_commit_count += 1
             tree_aware_path_commit(
                 target_cache,
@@ -644,6 +689,7 @@ def generate_ddtree_once(
         "slow_path_count": slow_path_count,
         "tree_aware_commit_count": tree_aware_commit_count,
         "tree_aware_linear": tree_aware_linear,
+        "exact_commit": exact_commit,
         "dflash_controller_enabled": controller_enabled,
         "dflash_controller_mode": controller_mode,
         "dflash_controller_probe_count": controller_probe_count,
