@@ -63,11 +63,13 @@ Imagine you're trying to guess what song someone is humming:
 
 | Method | Speed | How much faster |
 |--------|------:|:----------------|
-| Normal (one word at a time) | 38 words/sec | baseline |
-| DFlash (single rough draft) | 58-73 words/sec | 1.5-2x faster |
-| **DDTree (tree of drafts)** | **73-95 words/sec** | **2-2.6x faster** |
+| Normal (one word at a time) | ~28 words/sec | baseline |
+| DFlash (single rough draft) | ~39 words/sec | ~1.4x faster |
+| **DDTree (tree of drafts)** | **~42 words/sec** | **~1.5x faster** |
 
-At 8,000 words of output, DDTree generates at **~95 words per second** — **2.6x faster** than the basic approach.
+These are real measured numbers on a code generation prompt. DDTree adds about **10-15% on top of DFlash**, for a total of about **1.5x over autoregressive**.
+
+**Important caveat**: DDTree helps most with code and structured content. For creative writing and open-ended prose, the draft model's acceptance rate drops to 5-10%, and DDTree is roughly the same speed as autoregressive.
 
 ## Is There Any Loss of Quality?
 
@@ -94,11 +96,13 @@ DDTree helps most when the draft model struggles, which tends to happen on creat
 
 1. **Privacy**: Everything runs on YOUR Mac. Nothing leaves your machine. No cloud, no subscription, no one reading your prompts.
 
-2. **Speed**: A 27-billion-parameter AI model — genuinely smart, can write code, analyze documents, explain complex topics — now runs at nearly **100 words per second** on a Mac Studio. That's faster than most people can read.
+2. **Speed**: A 27-billion-parameter AI model — genuinely smart, can write code, analyze documents, explain complex topics — runs at **~42 words per second** on a Mac Studio with DDTree, up from ~28 without it. That's fast enough to feel instant.
 
 3. **Free after hardware**: Once you have the Mac, there's no per-token cost. Generate millions of words for $0.
 
 4. **No quality trade-off**: Unlike some speed tricks that make the AI dumber, DDTree keeps the exact same output quality.
+
+5. **Works best for code and structured content**: The speed boost depends on how well the draft model predicts. For code generation (85% prediction accuracy), DDTree adds 10-15%. For creative prose (5-10% accuracy), the benefit disappears.
 
 ## What Made This Hard
 

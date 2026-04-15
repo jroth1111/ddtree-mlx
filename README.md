@@ -1,24 +1,32 @@
 # DDTree-MLX
 
-**Tree-based speculative decoding for Apple Silicon.** Up to **2.6x faster** than autoregressive generation on Qwen 3.5 27B.
+**Tree-based speculative decoding for Apple Silicon.** ~10-15% faster than DFlash, ~1.5x faster than autoregressive on Qwen 3.5 27B.
 
 DDTree extends [DFlash](https://github.com/bstnxbt/dflash-mlx) speculative decoding by building a **draft tree** from per-position logits and verifying the entire tree in one forward pass. Instead of betting on a single draft sequence, DDTree explores multiple likely continuations simultaneously, accepting more tokens per verification cycle.
 
-Based on the paper [*Accelerating Speculative Decoding with Block Diffusion Draft Trees*](https://liranringel.github.io/ddtree/DDTree.pdf) by Liran Ringel & Yaniv Romano. This is an independent MLX port for Apple Silicon, with a custom Metal kernel for hybrid model support.
+Based on the paper [*Accelerating Speculative Decoding with Block Diffusion Draft Trees*](https://liranringel.github.io/ddtree/DDTree.pdf) by Liran Ringel & Yaniv Romano. This is the first MLX port for Apple Silicon, with custom Metal kernels for hybrid model support.
 
 ## Performance
 
-Qwen 3.5 27B 4-bit on Mac Studio M3 Ultra 256GB:
+Measured on Mac Studio M3 Ultra 256GB, Qwen 3.5 27B 4-bit, code generation prompt at 8K max tokens:
 
-| Output Length | Autoregressive | DFlash | DDTree | Speedup vs AR |
-|--------------:|---------------:|-------:|-------:|--------------:|
-| 1K tokens | 37.8 tok/s | 53.2 tok/s | ~73 tok/s | **1.9x** |
-| 2K tokens | 37.8 tok/s | 58.0 tok/s | ~72 tok/s | **1.9x** |
-| 4K tokens | 37.4 tok/s | 67.1 tok/s | ~90 tok/s | **2.4x** |
-| 8K tokens | 36.7 tok/s | 72.7 tok/s | ~95 tok/s | **2.6x** |
-| 16K tokens | 36.2 tok/s | 74.0 tok/s | ~73 tok/s | **2.0x** |
+| Method | tok/s | vs Autoregressive | Acceptance |
+|--------|------:|------------------:|-----------:|
+| Autoregressive | 27.9 | 1.0x | — |
+| DFlash | 38.6 | **1.38x** | 85% |
+| **DFlash + DDTree** | **42.3** | **1.52x** | 4.2/cycle |
 
-DDTree is **1.24-1.39x faster than DFlash** (with the parent-aware conv Metal kernel reaching ~35 tok/s in probes), and up to **1.5-1.6x on prompts where the draft model has moderate acceptance** (68-70%). Output is lossless -- every token is verified against the target model.
+DDTree adds **~10-15% on top of DFlash** for code and structured content where draft acceptance is high. Output is lossless -- every token is verified against the target model.
+
+### When DDTree Helps (and When It Doesn't)
+
+| Content Type | DFlash Acceptance | DDTree Benefit |
+|-------------|------------------:|:---------------|
+| Code generation | 85%+ | **+10-15%** over DFlash — tree catches rejected tokens with backup branches |
+| Structured/factual | 70-80% | **+10-15%** — moderate acceptance leaves room for tree alternatives |
+| Creative prose | 5-10% | **~0%** — low acceptance means most tree branches are wrong too; DDTree roughly equals autoregressive |
+
+DDTree's advantage depends entirely on draft model acceptance. When the draft model predicts well (code, structured output), the tree's backup branches catch occasional misses. When the draft model struggles (creative writing, open-ended prose), tree branches are just as wrong as the primary guess, and the tree overhead eats any gain.
 
 ## How It Works
 

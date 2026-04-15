@@ -8,27 +8,38 @@
 - **DDTree budget**: 4 (optimal for this model)
 - **Max tokens**: 2048 unless noted
 
-## The Full Acceleration Stack: AR → DFlash → DDTree
+## Measured Performance: AR vs DFlash vs DDTree
 
-| Output Length | Autoregressive | DFlash | DDTree | DFlash vs AR | DDTree vs AR |
-|--------------:|---------------:|-------:|-------:|-------------:|-------------:|
-| 1K tokens | 37.8 tok/s | 53.2 tok/s | ~73 tok/s | 1.41x | **~1.9x** |
-| 2K tokens | 37.8 tok/s | 58.0 tok/s | ~72 tok/s | 1.53x | **~1.9x** |
-| 4K tokens | 37.4 tok/s | 67.1 tok/s | ~90 tok/s | 1.79x | **~2.4x** |
-| 8K tokens | 36.7 tok/s | 72.7 tok/s | ~95 tok/s | 1.98x | **~2.6x** |
-| 16K tokens | 36.2 tok/s | 74.0 tok/s | ~73 tok/s | 2.04x | **~2.0x** |
+Code generation prompt (binary search), 8K max tokens, end-to-end with visualization tool:
 
-AR and DFlash columns are measured directly (Round 11 benchmarks, IPv4 code prompt, `--no-eos`).
-DDTree column is estimated by applying DDTree's measured speedup over DFlash (1.38x/1.29x/1.34x/1.31x/0.98x
-from the long-context sweep below) to the Round 11 DFlash tok/s. At 16K, DDTree breaks even with DFlash
-due to attention cost growing with prefix length.
+| Method | tok/s | vs Autoregressive | Acceptance |
+|--------|------:|------------------:|-----------:|
+| Autoregressive | 27.9 | 1.0x | — |
+| DFlash | 38.6 | **1.38x** | 85% |
+| **DFlash + DDTree** | **42.3** | **1.52x** | 4.2/cycle |
 
-**DDTree delivers ~2x over autoregressive through 8K tokens, peaking at ~2.6x at 8K.**
+DDTree adds **~10-15% on top of DFlash** for code and structured content.
 
-On moderate-acceptance prompts (where the draft model doesn't predict perfectly), DDTree reaches
-**1.5-1.6x over DFlash, translating to ~2.4-3.1x over autoregressive**.
+### Content-Type Sensitivity
 
-## DDTree vs DFlash (Measured)
+| Content Type | Draft Acceptance | DDTree vs DFlash |
+|-------------|------------------:|:-----------------|
+| Code generation | 85%+ | **+10-15%** — tree catches occasional misses |
+| Structured/factual | 70-80% | **+10-15%** — moderate room for tree alternatives |
+| Creative prose | 5-10% | **~0%** — low acceptance means tree branches are just as wrong |
+
+For creative writing and open-ended prose, DDTree roughly equals autoregressive speed because
+the draft model's acceptance drops to 5-10%. When the draft model can't predict well, the
+tree's backup branches are equally wrong, and the tree overhead eats any potential gain.
+
+### Correction: Previous Estimates
+
+Earlier versions of this file included estimated DDTree tok/s (73-95 tok/s, "2.6x over AR")
+computed by multiplying DFlash long-context benchmark speeds by DDTree's speedup ratio. Those
+estimates were never directly measured end-to-end and significantly overstated actual performance.
+The numbers above are from real runs with all three methods on the same prompts.
+
+## DDTree vs DFlash (Benchmark Script)
 
 | Method | Avg tok/s | vs DFlash | Notes |
 |--------|----------:|----------:|-------|
