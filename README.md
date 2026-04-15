@@ -140,6 +140,27 @@ ddtree_server.py  # OpenAI-compatible FastAPI server
 benchmark.py      # Benchmark script (DDTree vs DFlash comparison)
 ```
 
+## Quantization & Model Compatibility
+
+DDTree works at the architecture level (tree attention masks, per-token RoPE, parent-indexed recurrence), so it applies across **any quantization** of the same model family. For Qwen 3.5 27B on M3 Ultra:
+
+| Quantization | AR tok/s | Memory | DDTree estimated | vs AR |
+|-------------|----------:|-------:|-----------------:|------:|
+| 4-bit | 55 | ~16GB | ~73-95 tok/s | ~1.9-2.6x |
+| 6-bit | 56 | ~22GB | ~74-97 tok/s | ~1.9-2.6x |
+| mxfp8 | 57 | ~30GB | ~75-99 tok/s | ~1.9-2.6x |
+| bf16 | 57 | ~54GB | ~75-99 tok/s | ~1.9-2.6x |
+
+AR speeds are nearly identical across quantizations on M3 Ultra (memory bandwidth bottlenecked). Since DDTree's speedup is a multiplier on top of the base speed, the same ~2-2.6x ratio applies to all of them. The practical sweet spot is **4-bit** — same speed as bf16 but 3.4x less memory.
+
+### The Draft Model is Key
+
+DDTree's performance depends entirely on having a good **DFlash draft model** for the target model. The draft model (`z-lab/Qwen3.5-27B-DFlash`) is a small block diffusion model (~3GB) specifically trained to predict what Qwen 3.5 27B will say next. The better the draft model predicts, the higher the acceptance rate, and the bigger DDTree's speedup.
+
+Currently, DFlash drafters exist for the **Qwen 3.5 family**. As more DFlash drafters get trained for other model families (Llama, Mistral, etc.), DDTree automatically extends to them — no code changes needed. The tree construction, verification, and commit logic are model-agnostic; only the draft model needs to match the target.
+
+If no DFlash drafter is available for a model, DDTree cannot be used. This is the main adoption constraint — the acceleration is only as good as the draft model that powers it.
+
 ## Findings & Insights
 
 See [BENCHMARKS.md](BENCHMARKS.md) for detailed results, including:
