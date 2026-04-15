@@ -21,7 +21,7 @@ from .cache import fast_path_commit, tree_aware_path_commit
 
 
 # Default tree budget (configurable via env var or parameter)
-DEFAULT_TREE_BUDGET = int(os.environ.get("DDTREE_BUDGET", "8"))
+DEFAULT_TREE_BUDGET = int(os.environ.get("DDTREE_BUDGET", "4"))
 
 
 def _tree_token_id(tree: DDTree, root_token: int, tree_index: int) -> int:
@@ -218,7 +218,8 @@ def generate_ddtree_once(
                 cache=draft_cache,
             )
             draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
-            mx.eval(draft_logits)
+            # Skip mx.eval(draft_logits) — _build_tree_from_mlx_logits evals
+            # only the top-k subset, avoiding full vocab-size materialization
         else:
             draft_logits = None
         draft_ns += time.perf_counter_ns() - draft_start
@@ -393,7 +394,8 @@ def generate_ddtree_once(
                 else hidden_chunks[0]
             )
 
-        mx.eval(committed_hidden)
+        # Defer mx.eval(committed_hidden) — next cycle's draft forward
+        # implicitly evals it, allowing overlap with Python bookkeeping
         commit_ns += time.perf_counter_ns() - commit_start
 
         # --- UPDATE ---

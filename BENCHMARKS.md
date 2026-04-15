@@ -1,0 +1,127 @@
+# DDTree-MLX Benchmark Results & Findings
+
+## Setup
+
+- **Hardware**: Mac Studio M3 Ultra 256GB
+- **Target model**: `mlx-community/Qwen3.5-27B-4bit` (hybrid: 48 GatedDeltaNet + 16 full attention)
+- **Draft model**: `z-lab/Qwen3.5-27B-DFlash` (block diffusion drafter)
+- **Baseline**: DFlash speculative decoding (~25 tok/s on this hardware)
+- **DDTree budget**: 4 (optimal for this model)
+- **Max tokens**: 2048 unless noted
+
+## Final Performance
+
+| Method | Avg tok/s | vs DFlash | Notes |
+|--------|----------:|----------:|-------|
+| DFlash (baseline) | 25.1 | 1.00x | Block diffusion speculative decoding |
+| **DDTree-4** | **31.1** | **1.24x** | Tree-based speculative decoding |
+
+### Per-Prompt Breakdown
+
+| Prompt | DFlash Accept | DFlash tok/s | DDTree-4 tok/s | Speedup |
+|--------|-------------:|-------------:|---------------:|--------:|
+| TCP/UDP explanation | 70% | 18.9 | 28.8 | **1.52x** |
+| Binary search code | 86% | 39.3 | 37.5 | 0.95x |
+| French Revolution | 68% | 17.6 | 27.8 | **1.58x** |
+
+**Key insight**: DDTree excels when DFlash has moderate acceptance (68-70%), achieving 1.5-1.6x speedup. When DFlash already has high acceptance (86%), the tree overhead slightly exceeds the marginal acceptance gain.
+
+### Long-Context Scaling (DDTree-8)
+
+| Tokens | DFlash tok/s | DDTree-8 tok/s | Speedup |
+|-------:|-------------:|---------------:|--------:|
+| 1,024 | 13.3 | 18.4 | 1.38x |
+| 2,048 | 14.0 | 18.1 | 1.29x |
+| 4,096 | 13.9 | 18.6 | 1.34x |
+| 8,192 | 14.7 | 19.2 | 1.31x |
+| 16,384 | 13.0 | 12.7 | 0.98x |
+
+DDTree maintains 1.29-1.38x through 8K tokens. At 16K, attention cost over the long prefix causes DDTree to break even.
+
+## Phase Timing Breakdown
+
+DDTree-4, prompt 1 (1117 tokens generated):
+
+| Phase | Time | % Total |
+|-------|-----:|--------:|
+| Prefill | 223ms | 0.4% |
+| Draft | 8,156ms | 13.2% |
+| Tree Build | 887ms | 1.4% |
+| **Tree Verify** | **51,920ms** | **84.3%** |
+| Commit | 275ms | 0.4% |
+
+### Within Tree Verify (profiled)
+
+| Layer Type | Time | % of Verify |
+|------------|-----:|-----------:|
+| Linear (48 GatedDeltaNet) | 24,325ms | **73.2%** |
+| Attention (16 full attention) | 7,269ms | 21.9% |
+
+## Optimization History
+
+### What Worked
+
+1. **Custom Metal kernel for tree-aware GatedDelta** (PR #2)
+   - Parent-indexed recurrence instead of sequential depth-group processing
+   - Enables correct logits for ALL tree paths, not just DFS prefix
+   - Combined with tree_aware_path_commit: installs per-node states directly
+   - **Commit cost dropped 97%** (8,511ms -> 275ms)
+
+2. **Removing unnecessary mx.eval() sync points**
+   - Removed `mx.eval(draft_logits)` — `_build_tree_from_mlx_logits` evals only top-k
+   - Deferred `mx.eval(committed_hidden)` — next cycle evals implicitly
+   - Avoids full vocab-size tensor materialization and reduces GPU sync overhead
+
+3. **Budget=4 as default**
+   - 5 tree nodes is the sweet spot for this hybrid model
+   - 86% fast-path rate, 3.2 tokens accepted per cycle
+   - Higher budgets (8, 16, 32) increase verify cost faster than acceptance gains
+
+### What Didn't Work
+
+| Approach | Result | Why |
+|----------|--------|-----|
+| **Attention-only tree verify** | 0.44x (worse) | LM head needs all 64 layers; 16-layer hidden states produce garbage logits. avg_accept drops to 1.0. |
+| **Attention-only + keep MLP** | 0.34x (worse) | Even keeping feed-forward networks doesn't compensate for missing recurrent contributions. |
+| **Chain tree shape** | 1.14x (worse than heap) | Linear chain has 100% fast path but lower acceptance diversity. |
+| **Hybrid tree shape** | 0.98x (break-even) | Half chain + half root alternatives underperforms the heap algorithm. |
+| **Root-wide tree shape** | 0.75x (worse) | All siblings at depth 1 gives only 2.0 acceptance — not enough depth. |
+| **Split prefix/tree attention** | 1.24x (neutral) | Manual matmul + LSE combination is slower than MLX's optimized SDPA at 2K context. May help at 8K+. |
+| **Adaptive budget controller** | 1.25x (neutral) | Adds complexity, no measurable gain when eval reduction is already applied. |
+| **Breadth bias (depth_penalty)** | ~1.24x (neutral) | Tree is too small at budget=4 for depth redistribution to matter. |
+| **DFS-order mode** | 1.04x (worse than tree-aware) | DFS contamination of non-prefix paths reduces acceptance. |
+
+## Architecture Constraints
+
+The fundamental limitation is Qwen 3.5 27B's hybrid architecture:
+
+- **48/64 layers are recurrent** (GatedDeltaNet) — must process each tree node sequentially
+- **Per-node verify cost (~20ms) equals DFlash per-token cost (~21ms)** — no parallelism benefit for 75% of the model
+- DDTree's advantage comes from **better acceptance density**: the tree concentrates budget on the most probable tokens, achieving higher acceptance per verified node
+- On a **pure-attention model** (Llama, standard Qwen), DDTree would benefit much more since all layers could process tree nodes in parallel via the tree attention mask
+
+## Key Metrics
+
+- **Acceptance**: DDTree-4 accepts 3.2 tokens/cycle vs DFlash's 3.3 tokens/cycle — similar, but DDTree verifies only 5 nodes vs DFlash's 8 tokens
+- **Fast-path rate**: 86% of cycles use tape rollback (cheap commit); 14% require suffix re-forward
+- **Tree verify**: 84% of cycle time — the sole bottleneck
+- **Commit**: Essentially free (0.4%) thanks to tree_aware_path_commit
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DDTREE_BUDGET` | `4` | Tree node budget (excluding root) |
+| `DDTREE_TREE_AWARE_LINEAR` | `1` | Use parent-state forking for GatedDeltaNet |
+| `DDTREE_TREE_KERNEL` | `1` | Use Metal kernel for tree-aware recurrence |
+| `DDTREE_PROFILE_VERIFY` | `0` | Profile linear vs attention layer timing |
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `benchmarks_first_run.json` | Initial DDTree benchmarks (bonus double-count bug) |
+| `benchmarks_pr1_merged.json` | After PR#1 fix, budgets 16/32/64 |
+| `benchmarks_profile_small_budgets.json` | Profiled run, budgets 4/8/16 (linear vs attention breakdown) |
+| `bench_pr2_final.json` | PR#2 Metal kernel, budget 4, cooled GPU |
+| `bench_pr2_clean.json` | PR#2, budgets 4/8/16/24 |
