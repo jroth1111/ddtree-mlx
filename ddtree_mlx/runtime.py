@@ -24,6 +24,13 @@ from .cache import fast_path_commit, tree_aware_path_commit
 DEFAULT_TREE_BUDGET = int(os.environ.get("DDTREE_BUDGET", "4"))
 
 
+def _resolve_block_size(draft_block_size: int, block_tokens: int | None) -> int:
+    native_block_size = max(1, int(draft_block_size))
+    if block_tokens is None:
+        return native_block_size
+    return max(1, min(native_block_size, int(block_tokens)))
+
+
 def _tree_token_id(tree: DDTree, root_token: int, tree_index: int) -> int:
     if tree_index == 0:
         return int(root_token)
@@ -110,6 +117,7 @@ def generate_ddtree_once(
     tree_budget: int = DEFAULT_TREE_BUDGET,
     logw_cutoff: float | None = None,
     chain_seed: bool = False,
+    block_tokens: int | None = None,
     stop_token_ids: list[int] | None = None,
     suppress_token_ids: list[int] | None = None,
 ) -> dict:
@@ -124,6 +132,7 @@ def generate_ddtree_once(
         tree_budget: Number of tree nodes (excluding root).
         logw_cutoff: Optional cumulative log-probability cutoff for tree nodes.
         chain_seed: Seed the top-1 draft chain before alternate branches.
+        block_tokens: Optional cap for DDTree/DFlash tokens per cycle.
         stop_token_ids: Tokens that signal end of generation.
         suppress_token_ids: Tokens to suppress during generation.
 
@@ -188,7 +197,8 @@ def generate_ddtree_once(
         prefill_hidden, list(draft_model.target_layer_ids)
     )
 
-    block_size = max(1, int(draft_model.block_size))
+    native_block_size = max(1, int(draft_model.block_size))
+    block_size = _resolve_block_size(native_block_size, block_tokens)
     generated_tokens: list[int] = []
     start = prompt_len
     cycles_completed = 0
@@ -725,4 +735,7 @@ def generate_ddtree_once(
         "tree_budget": tree_budget,
         "logw_cutoff": logw_cutoff,
         "chain_seed": chain_seed,
+        "block_tokens": block_tokens,
+        "effective_block_size": block_size,
+        "native_block_size": native_block_size,
     }

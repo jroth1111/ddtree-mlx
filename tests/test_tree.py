@@ -8,7 +8,11 @@ from dflash_mlx.runtime import make_target_cache, target_forward_with_hidden_sta
 import ddtree_mlx.verify as verify_module
 from ddtree_mlx.cache import tree_aware_path_commit
 from ddtree_mlx.compile import compile_tree
-from ddtree_mlx.runtime import _build_tree_from_mlx_logits, _walk_dfs_exact_prefix
+from ddtree_mlx.runtime import (
+    _build_tree_from_mlx_logits,
+    _resolve_block_size,
+    _walk_dfs_exact_prefix,
+)
 from ddtree_mlx.verify import (
     _linear_forward_tree_aware,
     _split_prefix_tree_attention_exact,
@@ -219,6 +223,13 @@ def test_chain_seed_then_expands_siblings_with_remaining_budget():
     assert seeded.node_token_ids.tolist() == [10, 20, 11, 21]
     assert seeded.node_depths.tolist() == [1, 2, 1, 2]
     assert seeded.parents == [-1, 0, 1, 0, 1]
+
+
+def test_resolve_block_size_caps_to_native_block_size():
+    assert _resolve_block_size(16, None) == 16
+    assert _resolve_block_size(16, 8) == 8
+    assert _resolve_block_size(16, 32) == 16
+    assert _resolve_block_size(16, 0) == 1
 
 
 def test_visibility_is_ancestor_only():
