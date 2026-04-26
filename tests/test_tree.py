@@ -157,6 +157,70 @@ def test_logw_cutoff_can_prune_all_nodes():
     assert tree.visibility.shape == (1, 1)
 
 
+def test_chain_seed_prefers_rank_zero_path_before_branches():
+    top_token_ids = np.array(
+        [
+            [10, 11, 12],
+            [20, 21, 22],
+            [30, 31, 32],
+        ],
+        dtype=np.int64,
+    )
+    top_log_probs = np.array(
+        [
+            [-0.1, -0.2, -5.0],
+            [-1.5, -1.6, -5.0],
+            [-1.5, -1.6, -5.0],
+        ],
+        dtype=np.float32,
+    )
+
+    best_first = build_ddtree_tree_from_topk(top_token_ids, top_log_probs, budget=3)
+    seeded = build_ddtree_tree_from_topk(
+        top_token_ids,
+        top_log_probs,
+        budget=3,
+        chain_seed=True,
+    )
+
+    assert best_first.node_token_ids.tolist() == [10, 11, 20]
+    assert best_first.node_depths.tolist() == [1, 1, 2]
+    assert seeded.node_token_ids.tolist() == [10, 20, 30]
+    assert seeded.node_depths.tolist() == [1, 2, 3]
+    assert seeded.parents == [-1, 0, 1, 2]
+    assert seeded.child_maps[0] == {10: 1}
+    assert seeded.child_maps[1] == {20: 2}
+    assert seeded.child_maps[2] == {30: 3}
+
+
+def test_chain_seed_then_expands_siblings_with_remaining_budget():
+    top_token_ids = np.array(
+        [
+            [10, 11, 12],
+            [20, 21, 22],
+        ],
+        dtype=np.int64,
+    )
+    top_log_probs = np.array(
+        [
+            [-0.1, -0.2, -5.0],
+            [-0.3, -0.4, -5.0],
+        ],
+        dtype=np.float32,
+    )
+
+    seeded = build_ddtree_tree_from_topk(
+        top_token_ids,
+        top_log_probs,
+        budget=4,
+        chain_seed=True,
+    )
+
+    assert seeded.node_token_ids.tolist() == [10, 20, 11, 21]
+    assert seeded.node_depths.tolist() == [1, 2, 1, 2]
+    assert seeded.parents == [-1, 0, 1, 0, 1]
+
+
 def test_visibility_is_ancestor_only():
     """Verify that visibility matrix only allows ancestor attention."""
     np.random.seed(0)

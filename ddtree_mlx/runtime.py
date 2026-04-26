@@ -39,6 +39,7 @@ def _build_tree_from_mlx_logits(
     *,
     budget: int,
     logw_cutoff: float | None = None,
+    chain_seed: bool = False,
 ) -> DDTree:
     """Build a DDTree while transferring only top-k draft data to CPU."""
     if budget <= 0 or int(draft_logits.shape[0]) == 0:
@@ -47,6 +48,7 @@ def _build_tree_from_mlx_logits(
             np.empty((0, 0), dtype=np.float32),
             budget,
             logw_cutoff=logw_cutoff,
+            chain_seed=chain_seed,
         )
 
     topk = min(int(budget), int(draft_logits.shape[-1]))
@@ -64,6 +66,7 @@ def _build_tree_from_mlx_logits(
         np.array(top_log_probs, copy=False),
         budget=budget,
         logw_cutoff=logw_cutoff,
+        chain_seed=chain_seed,
     )
 
 
@@ -106,6 +109,7 @@ def generate_ddtree_once(
     max_new_tokens: int = 2048,
     tree_budget: int = DEFAULT_TREE_BUDGET,
     logw_cutoff: float | None = None,
+    chain_seed: bool = False,
     stop_token_ids: list[int] | None = None,
     suppress_token_ids: list[int] | None = None,
 ) -> dict:
@@ -119,6 +123,7 @@ def generate_ddtree_once(
         max_new_tokens: Maximum tokens to generate.
         tree_budget: Number of tree nodes (excluding root).
         logw_cutoff: Optional cumulative log-probability cutoff for tree nodes.
+        chain_seed: Seed the top-1 draft chain before alternate branches.
         stop_token_ids: Tokens that signal end of generation.
         suppress_token_ids: Tokens to suppress during generation.
 
@@ -433,6 +438,7 @@ def generate_ddtree_once(
             draft_logits_2d,
             budget=tree_budget,
             logw_cutoff=logw_cutoff,
+            chain_seed=chain_seed,
         )
         root_token = int(staged_first.item())
         compiled = compile_tree(tree, root_token, prefix_len=start)
@@ -718,4 +724,5 @@ def generate_ddtree_once(
         "phase_timings_us": phase_timings,
         "tree_budget": tree_budget,
         "logw_cutoff": logw_cutoff,
+        "chain_seed": chain_seed,
     }
