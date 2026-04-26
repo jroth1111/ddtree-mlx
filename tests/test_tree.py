@@ -16,7 +16,12 @@ from ddtree_mlx.verify import (
     tree_verify_forward,
 )
 from ddtree_mlx.kernels import tree_conv1d_kernel
-from ddtree_mlx.tree import build_ddtree_tree, follow_verified_tree, compute_dfs_order
+from ddtree_mlx.tree import (
+    build_ddtree_tree,
+    build_ddtree_tree_from_topk,
+    follow_verified_tree,
+    compute_dfs_order,
+)
 
 
 def test_empty_budget():
@@ -64,6 +69,92 @@ def test_basic_tree_structure():
     # All depths are >= 1
     assert np.all(tree.node_depths >= 1)
     assert np.all(tree.node_depths <= 3)
+
+
+def test_logw_cutoff_none_preserves_topk_tree():
+    top_token_ids = np.array(
+        [
+            [10, 11, 12],
+            [20, 21, 22],
+            [30, 31, 32],
+        ],
+        dtype=np.int64,
+    )
+    top_log_probs = np.array(
+        [
+            [-0.1, -0.7, -1.8],
+            [-0.2, -0.6, -1.5],
+            [-0.3, -0.9, -1.7],
+        ],
+        dtype=np.float32,
+    )
+
+    baseline = build_ddtree_tree_from_topk(top_token_ids, top_log_probs, budget=6)
+    cutoff = build_ddtree_tree_from_topk(
+        top_token_ids,
+        top_log_probs,
+        budget=6,
+        logw_cutoff=float("-inf"),
+    )
+
+    assert cutoff.node_token_ids.tolist() == baseline.node_token_ids.tolist()
+    assert cutoff.node_depths.tolist() == baseline.node_depths.tolist()
+    assert cutoff.parents == baseline.parents
+    assert cutoff.child_maps == baseline.child_maps
+    assert np.array_equal(cutoff.visibility, baseline.visibility)
+
+
+def test_logw_cutoff_prunes_tail_nodes_and_keeps_valid_tree():
+    top_token_ids = np.array(
+        [
+            [10, 11, 12],
+            [20, 21, 22],
+            [30, 31, 32],
+        ],
+        dtype=np.int64,
+    )
+    top_log_probs = np.array(
+        [
+            [-0.1, -0.7, -1.8],
+            [-0.2, -0.6, -1.5],
+            [-0.3, -0.9, -1.7],
+        ],
+        dtype=np.float32,
+    )
+
+    tree = build_ddtree_tree_from_topk(
+        top_token_ids,
+        top_log_probs,
+        budget=8,
+        logw_cutoff=-0.8,
+    )
+
+    assert tree.node_count == 5
+    assert tree.node_token_ids.tolist() == [10, 20, 30, 11, 21]
+    assert tree.node_depths.tolist() == [1, 2, 3, 1, 2]
+    assert tree.parents == [-1, 0, 1, 2, 0, 1]
+    assert len(tree.child_maps) == 1 + tree.node_count
+    assert tree.visibility.shape == (1 + tree.node_count, 1 + tree.node_count)
+    for idx in range(1, 1 + tree.node_count):
+        assert tree.visibility[idx, idx]
+        assert 0 <= tree.parents[idx] < idx
+
+
+def test_logw_cutoff_can_prune_all_nodes():
+    top_token_ids = np.array([[10, 11]], dtype=np.int64)
+    top_log_probs = np.array([[-0.1, -0.2]], dtype=np.float32)
+
+    tree = build_ddtree_tree_from_topk(
+        top_token_ids,
+        top_log_probs,
+        budget=2,
+        logw_cutoff=0.0,
+    )
+
+    assert tree.node_count == 0
+    assert tree.parents == [-1]
+    assert tree.child_maps == [{}]
+    assert tree.visibility.shape == (1, 1)
 
 
 def test_visibility_is_ancestor_only():

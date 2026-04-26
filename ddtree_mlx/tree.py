@@ -33,6 +33,7 @@ def build_ddtree_tree_from_topk(
     top_token_ids: np.ndarray,
     top_log_probs: np.ndarray,
     budget: int,
+    logw_cutoff: float | None = None,
 ) -> DDTree:
     """Build a DDTree from precomputed per-position top-k log-probs.
 
@@ -40,6 +41,9 @@ def build_ddtree_tree_from_topk(
         top_token_ids: (L, K) int array sorted by descending log-probability.
         top_log_probs: (L, K) float array aligned with top_token_ids.
         budget: Maximum number of tree nodes (excluding root).
+        logw_cutoff: Optional cumulative log-probability cutoff. Because the
+            heap pops candidates from highest to lowest cumulative log weight,
+            expansion stops when the next candidate falls below this threshold.
     """
     if budget <= 0 or top_token_ids.shape[0] == 0 or top_token_ids.shape[1] == 0:
         visibility = np.zeros((1, 1), dtype=np.bool_)
@@ -57,6 +61,7 @@ def build_ddtree_tree_from_topk(
     top_log_probs = np.asarray(top_log_probs, dtype=np.float32)
     topk = min(int(budget), int(top_token_ids.shape[1]))
     depth_limit = int(top_token_ids.shape[0])
+    cutoff = float("-inf") if logw_cutoff is None else float(logw_cutoff)
 
     # Best-first heap search (Algorithm 1)
     # Heap entries: (-logw, ranks_tuple, parent_index, depth, rank, logw)
@@ -74,6 +79,8 @@ def build_ddtree_tree_from_topk(
 
     while heap and node_count < budget:
         _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)
+        if logw < cutoff:
+            break
 
         token_id = int(top_token_ids[depth - 1, rank])
         current_index = node_count + 1
@@ -88,13 +95,15 @@ def build_ddtree_tree_from_topk(
         if rank + 1 < topk:
             sibling_ranks = ranks[:-1] + (rank + 1,)
             sibling_logw = logw - float(top_log_probs[depth - 1, rank]) + float(top_log_probs[depth - 1, rank + 1])
-            heapq.heappush(heap, (-sibling_logw, sibling_ranks, parent_index, depth, rank + 1, sibling_logw))
+            if sibling_logw >= cutoff:
+                heapq.heappush(heap, (-sibling_logw, sibling_ranks, parent_index, depth, rank + 1, sibling_logw))
 
         # Push first child (rank 0 at next depth)
         if depth < depth_limit:
             child_ranks = ranks + (0,)
             child_logw = logw + float(top_log_probs[depth, 0])
-            heapq.heappush(heap, (-child_logw, child_ranks, current_index, depth + 1, 0, child_logw))
+            if child_logw >= cutoff:
+                heapq.heappush(heap, (-child_logw, child_ranks, current_index, depth + 1, 0, child_logw))
 
     # Build visibility matrix (ancestor-only attention mask)
     current_length = 1 + node_count
@@ -118,6 +127,7 @@ def build_ddtree_tree_from_topk(
 def build_ddtree_tree(
     draft_logits: np.ndarray,
     budget: int,
+    logw_cutoff: float | None = None,
 ) -> DDTree:
     """Build an optimal draft tree from block diffusion per-position logits.
 
@@ -128,6 +138,7 @@ def build_ddtree_tree(
         draft_logits: (L, vocab_size) float32 — per-position logits from
             the DFlash draft model for positions 1..L after the bonus token.
         budget: Maximum number of tree nodes (excluding root).
+        logw_cutoff: Optional cumulative log-probability cutoff.
 
     Returns:
         DDTree namedtuple with tree structure and visibility matrix.
@@ -137,6 +148,7 @@ def build_ddtree_tree(
             np.empty((0, 0), dtype=np.int64),
             np.empty((0, 0), dtype=np.float32),
             budget,
+            logw_cutoff=logw_cutoff,
         )
 
     topk = min(budget, draft_logits.shape[-1])
@@ -159,6 +171,7 @@ def build_ddtree_tree(
         top_token_ids=top_token_ids,
         top_log_probs=top_log_probs,
         budget=budget,
+        logw_cutoff=logw_cutoff,
     )
 
 
